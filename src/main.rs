@@ -37,6 +37,11 @@ const OWNER_MD5: [u8; 16] = [
 ];
 const MARKER: &str = "/tmp/.owner_flash\0";
 
+// Expected model token at the start of the section version string (e.g.
+// "RV6688v2_SERCOMM_MTS_3346"). Refuse images whose version doesn't match -> never
+// flash a wrong-model image. (OEM only LOGS the version; we enforce it.)
+const EXPECT_MODEL: &[u8] = b"RV6688v2";
+
 // ===================== libc (static musl) =====================
 unsafe extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
@@ -383,6 +388,30 @@ fn swap_commit(rf: u32) {
     unsafe { close(fd) };
 }
 
+/// Log image-vs-flash rootfs version (like OEM) and REFUSE if the image's version
+/// doesn't start with the expected model token (stricter than OEM, which only logs).
+fn check_version(hdr: &[u8]) {
+    let v = &hdr[0x40..];
+    let vlen = v.iter().position(|&c| c == 0).unwrap_or(v.len());
+    let img_ver = &v[..vlen];
+    eprint(b"rootfs version in image = ");
+    eprint(img_ver);
+    eprint(b"\n");
+    if let Some(flash) = read_file(b"/etc/build_tag\0") {
+        let end = flash
+            .iter()
+            .rposition(|&c| c > 0x20)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        eprint(b"rootfs version in flash = ");
+        eprint(&flash[..end]);
+        eprint(b"\n");
+    }
+    if !img_ver.starts_with(EXPECT_MODEL) {
+        die(b"image model/version mismatch -- refusing (wrong device?)");
+    }
+}
+
 // ===================== driver =====================
 fn flash(img_path: &[u8], do_reboot: bool) {
     let img = read_file(img_path).unwrap_or_else(|| die(b"cannot read image"));
@@ -413,6 +442,7 @@ fn flash(img_path: &[u8], do_reboot: bool) {
 
         if name == b"kernel_rootfs" {
             let dev = inactive_rootfs(rf);
+            check_version(hdr); // log version (like OEM) + REFUSE on wrong model
             eprint(b"writing kernel_rootfs -> inactive rootfs bank\n");
             prescan_bad(dev, payload.len()); // abort BEFORE erasing if the bank has bad blocks
             if shell(erase_dev(rf, false)) != 0 {
