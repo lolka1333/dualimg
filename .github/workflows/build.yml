@@ -46,7 +46,7 @@ jobs:
 
       # 3) Build the static MIPS flasher (target + build-std from .cargo/config.toml).
       - name: Build
-        run: cargo +nightly build --release
+        run: cargo +nightly build -Z json-target-spec --release
 
       - name: Inspect ELF
         run: |
