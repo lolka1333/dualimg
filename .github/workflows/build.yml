@@ -1,0 +1,60 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) MIPS32r1 big-endian SOFT-FLOAT toolchain (musl-cross-make).
+      - name: Cache musl-cross-make toolchain
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: /opt/mips-linux-muslsf
+          key: muslsf-mips32-v1
+
+      - name: Build musl-cross-make (mips-linux-muslsf, --with-arch=mips32 --with-float=soft)
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget bison flex texinfo git
+          cd /tmp
+          git clone --depth=1 https://github.com/richfelker/musl-cross-make.git
+          cd musl-cross-make
+          cat > config.mak <<'EOF'
+          TARGET = mips-linux-muslsf
+          OUTPUT = /opt/mips-linux-muslsf
+          GCC_CONFIG += --with-arch=mips32 --with-float=soft
+          EOF
+          for i in 1 2 3 4 5; do make -j"$(nproc)" && break || sleep 20; done
+          make install
+
+      - name: Add toolchain to PATH
+        run: echo "/opt/mips-linux-muslsf/bin" >> "$GITHUB_PATH"
+
+      # 2) Nightly Rust + rust-src (MIPS32 is Tier 3 -> build-std).
+      - name: Install Rust nightly
+        run: |
+          rustup toolchain install nightly --component rust-src --profile minimal
+          rustup default nightly
+          rustc --version
+
+      # 3) Build the static MIPS flasher (target + build-std from .cargo/config.toml).
+      - name: Build
+        run: cargo +nightly build --release
+
+      - name: Inspect ELF
+        run: |
+          F=target/mips-rv6699/release/dualimg
+          /opt/mips-linux-muslsf/bin/mips-linux-muslsf-readelf -hA "$F" | head -40
+          ls -l "$F"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dualimg-mips
+          path: target/mips-rv6699/release/dualimg

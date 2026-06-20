@@ -1,0 +1,6 @@
+# MIPS32 (mips-unknown-linux-*) is Tier 3 since Rust 1.72 -> no prebuilt std,
+# so we build core+alloc from source with -Z build-std (nightly required).
+# rust-src gives the std sources build-std needs.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

@@ -1,0 +1,25 @@
+[package]
+name = "dualimg"
+version = "0.1.0"
+edition = "2024"
+description = "From-scratch RV6699 firmware flasher (own dualImage_ctrl), no_std MIPS32-BE"
+
+[[bin]]
+name = "dualimg"
+path = "src/main.rs"
+
+# Pure-Rust, no_std crypto + inflate (no OpenSSL, matches the OEM byte-spec).
+[dependencies]
+md-5      = { version = "0.10", default-features = false }
+sha2      = { version = "0.10", default-features = false }
+aes       = { version = "0.8",  default-features = false }
+cbc       = { version = "0.1",  default-features = false, features = ["alloc", "block-padding"] }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+
+[profile.release]
+opt-level = "z"      # size; flasher is I/O-bound, not CPU
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = true   # keep arithmetic checks (a flasher must not silently wrap)
