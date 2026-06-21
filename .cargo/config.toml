@@ -5,7 +5,6 @@ target = "mips-rv6699.json"
 
 [unstable]
 build-std = ["core", "alloc", "panic_abort"]
-# provides memcpy/memset/memcmp/bcmp/memmove from compiler_builtins (we link -lc too as backup)
 build-std-features = ["compiler-builtins-mem"]
 
 [target.mips-rv6699]
@@ -15,5 +14,6 @@ rustflags = [
   "-C", "relocation-model=static",
   "-C", "link-arg=-static",
   "-C", "link-arg=-no-pie",
-  "-C", "link-arg=-lc",
+  "-C", "link-arg=-Wl,-Bstatic",
+  "-C", "link-arg=-l:libc.a",
 ]
