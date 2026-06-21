@@ -475,7 +475,6 @@ fn flash(img_path: &[u8], do_reboot: bool) {
     eprint(b"flash OK: inactive bank written+verified, boot flag swapped.\n");
 
     if do_reboot {
-        sync();
         unsafe { sync() };
         shell(b"/usr/sbin/rc reboot start\0");
     } else {
