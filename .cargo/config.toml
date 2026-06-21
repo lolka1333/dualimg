@@ -1,18 +1,19 @@
-# Build:  cargo +nightly build --release
-# (target + build-std are pinned here so a plain `cargo build` works in CI.)
+# Build:  cargo +nightly build -Z json-target-spec --release
 
 [build]
 target = "mips-rv6699.json"
 
 [unstable]
 build-std = ["core", "alloc", "panic_abort"]
+# provides memcpy/memset/memcmp/bcmp/memmove from compiler_builtins (we link -lc too as backup)
+build-std-features = ["compiler-builtins-mem"]
 
 [target.mips-rv6699]
-# musl-cross-make soft-float toolchain (same family used for dropbear).
 linker = "mips-linux-muslsf-gcc"
 rustflags = [
   "-C", "target-cpu=mips32",
   "-C", "relocation-model=static",
   "-C", "link-arg=-static",
   "-C", "link-arg=-no-pie",
+  "-C", "link-arg=-lc",
 ]
