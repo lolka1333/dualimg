@@ -1,12 +1,13 @@
-//! voipcli — minimal AF_UNIX client for the vgw_app voice CLI socket.
-//! Connects to /var/voice/voip_cli.sock, sends argv[1] as one command line,
-//! then relays the (streaming) response to stdout until the socket closes.
+//! voipcli — sends a CLI command to vgw_app's voice CGI socket (/var/voice/voip_cli.sock).
 //!
-//! Record a call (run in background, place/answer the call, then kill it):
-//!   voipcli "rtp_dump 0 rtp both 1000" > /var/dump.txt &
-//!   ... call ...
-//!   killall voipcli      # or: kill %1
-//! Then decode dump.txt -> WAV on the PC (rtp_to_wav.py).
+//! Protocol (reverse-engineered): the socket is AF_UNIX **SOCK_DGRAM** (MIPS type=1).
+//! vgw read()s a fixed 136-byte (0x88) message and dispatches on cmd_type:
+//!     struct { u32 magic = 0x33229922; u32 cmd_type; u8 data[128]; }  (big-endian)
+//! cmd_type 0x12 = "run CLI command" (data = the command line, e.g. "rtp_dump 0 rtp both 1000").
+//! The command output is NOT returned on the socket — vgw's cli_print writes it to
+//! /dev/console + /dev/pts/0..3. Capture it from a pty (ssh -tt ... > dump.txt).
+//!
+//!   voipcli "rtp_dump 0 rtp both 1000"
 
 #![no_std]
 #![no_main]
@@ -17,15 +18,16 @@ unsafe extern "C" {
     fn socket(domain: c_int, ty: c_int, proto: c_int) -> c_int;
     fn connect(fd: c_int, addr: *const c_void, len: u32) -> c_int;
     fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
-    fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
     fn close(fd: c_int) -> c_int;
     fn strlen(s: *const c_char) -> usize;
     fn exit(code: c_int) -> !;
 }
 
 const AF_UNIX: c_int = 1;
-const SOCK_DGRAM: c_int = 1; // MIPS: SOCK_DGRAM=1, SOCK_STREAM=2 (swapped vs x86); vgw uses DGRAM, no listen()
+const SOCK_DGRAM: c_int = 1; // MIPS: DGRAM=1, STREAM=2 (swapped vs x86)
 const SOCK_PATH: &[u8] = b"/var/voice/voip_cli.sock";
+const MAGIC: u32 = 0x3322_9922;
+const CMD_RUN_CLI: u32 = 0x12;
 
 #[repr(C)]
 struct SockaddrUn {
@@ -40,20 +42,16 @@ fn p(_: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
-    // command = argv[1] + '\n'  (defaults to "help")
-    let mut cmd = [0u8; 256];
-    let mut clen;
+    // build the 136-byte CGI message
+    let mut msg = [0u8; 136];
+    msg[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+    msg[4..8].copy_from_slice(&CMD_RUN_CLI.to_be_bytes());
     if argc >= 2 {
         let a = unsafe { *argv.add(1) };
         let l = unsafe { strlen(a) };
         let s = unsafe { core::slice::from_raw_parts(a as *const u8, l) };
-        clen = if l > 254 { 254 } else { l };
-        cmd[..clen].copy_from_slice(&s[..clen]);
-        cmd[clen] = b'\n';
-        clen += 1;
-    } else {
-        cmd[..5].copy_from_slice(b"help\n");
-        clen = 5;
+        let n = if l > 127 { 127 } else { l };
+        msg[8..8 + n].copy_from_slice(&s[..n]);
     }
 
     let fd = unsafe { socket(AF_UNIX, SOCK_DGRAM, 0) };
@@ -69,10 +67,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     if unsafe { connect(fd, &addr as *const SockaddrUn as *const c_void, len) } < 0 {
         return 2;
     }
-    // DGRAM: send the command. The CLI response is NOT returned on the socket --
-    // vgw's cli_print writes it to /dev/console + /dev/pts/0..3 (and /var/voice/cgi_cli_data
-    // in file mode). So we just deliver the command and exit; capture the output elsewhere.
-    unsafe { write(fd, cmd.as_ptr() as *const c_void, clen) };
+    unsafe { write(fd, msg.as_ptr() as *const c_void, 136) };
     unsafe { close(fd) };
     0
 }
