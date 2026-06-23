@@ -24,7 +24,7 @@ unsafe extern "C" {
 }
 
 const AF_UNIX: c_int = 1;
-const SOCK_STREAM: c_int = 2;
+const SOCK_DGRAM: c_int = 1; // MIPS: SOCK_DGRAM=1, SOCK_STREAM=2 (swapped vs x86); vgw uses DGRAM, no listen()
 const SOCK_PATH: &[u8] = b"/var/voice/voip_cli.sock";
 
 #[repr(C)]
@@ -56,7 +56,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         clen = 5;
     }
 
-    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+    let fd = unsafe { socket(AF_UNIX, SOCK_DGRAM, 0) };
     if fd < 0 {
         return 1;
     }
@@ -69,17 +69,10 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     if unsafe { connect(fd, &addr as *const SockaddrUn as *const c_void, len) } < 0 {
         return 2;
     }
+    // DGRAM: send the command. The CLI response is NOT returned on the socket --
+    // vgw's cli_print writes it to /dev/console + /dev/pts/0..3 (and /var/voice/cgi_cli_data
+    // in file mode). So we just deliver the command and exit; capture the output elsewhere.
     unsafe { write(fd, cmd.as_ptr() as *const c_void, clen) };
-
-    // relay socket -> stdout until EOF (kill the process to stop after the call)
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n <= 0 {
-            break;
-        }
-        unsafe { write(1, buf.as_ptr() as *const c_void, n as usize) };
-    }
     unsafe { close(fd) };
     0
 }
