@@ -8,6 +8,10 @@ description = "From-scratch RV6699 firmware flasher (own dualImage_ctrl), no_std
 name = "dualimg"
 path = "src/main.rs"
 
+[[bin]]
+name = "voipcli"
+path = "src/bin/voipcli.rs"
+
 # Pure-Rust, no_std crypto + inflate (no OpenSSL, matches the OEM byte-spec).
 [dependencies]
 md-5      = { version = "0.10", default-features = false }
