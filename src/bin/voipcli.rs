@@ -300,7 +300,7 @@ fn send_packet(info: &ChanInfo, ch: u32, pkt: &[u8]) -> u32 {
     unsafe {
         let fd = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
         if fd < 0 {
-            return false;
+            return u32::MAX;
         }
         // EPPACKET { u32 mediaType; void *data; } — mediaType 0 = RTP (payload_type 1 - 1)
         let eppacket: [u32; 2] = [0, pkt.as_ptr() as u32];
