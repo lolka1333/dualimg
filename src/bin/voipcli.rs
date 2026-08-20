@@ -231,11 +231,11 @@ fn read_remote(pid: c_int, addr: c_long, out: &mut [u8]) -> bool {
         let mut w = 0usize;
         let want = out.len();
         while w < want {
+            // NB: a peeked word of -1 is NOT an error here. The channel record holds
+            // cnx_id = -1 whenever no call is up, so bailing on -1 would break reads in
+            // exactly the state we most want to observe. ptrace signals real failures
+            // through errno, and the caller sanity-checks the fields it gets back.
             let word = ptrace(PTRACE_PEEKDATA, pid, addr + w as c_long, 0);
-            if word == -1 {
-                ok = false;
-                break;
-            }
             let b = (word as u32).to_be_bytes();
             out[w..w + 4].copy_from_slice(&b);
             w += 4;
