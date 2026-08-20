@@ -78,6 +78,12 @@ const IOCTL_ENDPT_SIGNAL: c_long = 0xc024_d105u32 as i32 as c_long;
 const EPSIG_RINGING: u32 = 0x0F;
 const EPSIG_RINGING_INT: u32 = 0x10; // internal-call variant used by ring_callerid_off
 const EPSIG_CALLERID: u32 = 0x3B;
+// Runtime provisioning (vrgEndptProvSet @0x4e3670). The telephony profile in
+// /etc/telephonyProfiles.d/RU_profile.xml is pushed into the driver through this very
+// call, so the same items can be re-set live — no read-only file to patch, no reflash.
+const IOCTL_ENDPT_PROVSET: c_long = 0xc018_d11du32 as i32 as c_long;
+const PROV_RING_VOLTAGE: u32 = 0x0a2b; // volts, ships at 57
+const RING_VOLTAGE_MAX: u32 = 90; // SLIC ceiling; the profile enables HighVoltageRingSupport
 // ---- SIP channel: vgw's own stack listens on the operator VLAN address ----
 const AF_INET: c_int = 2;
 const SOL_SOCKET: c_int = 0xffff; // MIPS
@@ -479,6 +485,41 @@ fn sip_invite(dest: &[u8], to_user: &[u8], from_user: &[u8], host: &[u8]) -> c_i
     }
 }
 
+/// Set one endpoint provisioning item (4-byte integer value) on a channel.
+fn prov_set(ch: u32, item: u32, value: u32) -> bool {
+    unsafe {
+        let fd = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
+        if fd < 0 {
+            say(b"voipcli: cannot open /dev/bcmendpoint0
+");
+            return false;
+        }
+        let val: u32 = value;
+        // struct: size, lineId, item, value ptr, value len, status
+        let mut parm: [u32; 6] = [
+            0x18,
+            ch,
+            item,
+            &val as *const u32 as u32,
+            4,
+            8,
+        ];
+        let rc = ioctl(fd, IOCTL_ENDPT_PROVSET, parm.as_mut_ptr() as *mut c_void);
+        close(fd);
+        if rc != 0 {
+            say(b"voipcli: provisioning ioctl failed
+");
+            return false;
+        }
+        if parm[5] != 0 {
+            say(b"voipcli: endpoint rejected the value
+");
+            return false;
+        }
+        true
+    }
+}
+
 /// Legacy path: hand a command line to vgw's CLI over the CGI socket.
 fn send_cli(cmd: &[u8]) -> c_int {
     let mut msg = [0u8; 136];
@@ -546,6 +587,38 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         }
         hx[o] = b'\n';
         say(&hx[..o + 1]);
+        return 0;
+    }
+
+    // --- provisioning: ring loudness and any other endpoint item, applied live ---
+    if a1 == b"ringvolt" || a1 == b"prov" {
+        let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
+        let (item, value) = if a1 == b"ringvolt" {
+            if argc < 4 {
+                say(b"usage: voipcli ringvolt <ch> <volts>   (stock 57, ceiling 90)
+");
+                return 1;
+            }
+            let mut v = atoi(arg(argv, 3));
+            if v > RING_VOLTAGE_MAX {
+                say(b"voipcli: clamping to the 90 V SLIC ceiling
+");
+                v = RING_VOLTAGE_MAX;
+            }
+            (PROV_RING_VOLTAGE, v)
+        } else {
+            if argc < 5 {
+                say(b"usage: voipcli prov <ch> <item> <value>   (item is decimal, e.g. 2603 = RingVoltage)
+");
+                return 1;
+            }
+            (atoi(arg(argv, 3)), atoi(arg(argv, 4)))
+        };
+        if !prov_set(ch, item, value) {
+            return 7;
+        }
+        say(b"voipcli: applied
+");
         return 0;
     }
 
