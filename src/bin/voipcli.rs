@@ -53,6 +53,7 @@ unsafe extern "C" {
     fn setsockopt(fd: c_int, lvl: c_int, opt: c_int, val: *const c_void, len: u32) -> c_int;
     fn getpid() -> c_int;
     fn usleep(us: u32) -> c_int;
+    fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
     fn exit(code: c_int) -> !;
 }
 
@@ -651,6 +652,48 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
     }
 }
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Channel a long-running command is currently ringing, so an interrupt can silence it.
+static RINGING_CH: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Ctrl-C / kill would otherwise leave the bell ringing forever, since the DSP keeps
+/// going until something tells it to stop. Silence the channel, then exit.
+extern "C" fn on_interrupt(_sig: c_int) {
+    let ch = RINGING_CH.load(Ordering::Relaxed);
+    if ch != u32::MAX {
+        if let Some(i) = chan_info(ch) {
+            endpt_signal(&i.state, EPSIG_RINGING, 0);
+            endpt_signal(&i.state, EPSIG_RINGING_INT, 0);
+        }
+        say(b"\nvoipcli: interrupted, ring stopped\n");
+    }
+    unsafe { exit(130) }
+}
+
+fn arm_interrupt(ch: u32) {
+    RINGING_CH.store(ch, Ordering::Relaxed);
+    unsafe {
+        signal(2, on_interrupt); // SIGINT
+        signal(15, on_interrupt); // SIGTERM
+    }
+}
+
+/// Silence everything on a channel: both ring variants plus the tone generator.
+fn stop_channel(ch: u32) -> c_int {
+    if let Some(i) = chan_info(ch) {
+        endpt_signal(&i.state, EPSIG_RINGING, 0);
+        endpt_signal(&i.state, EPSIG_RINGING_INT, 0);
+    }
+    let mut cmd = [0u8; 32];
+    let head = b"dsp tone_off ";
+    cmd[..head.len()].copy_from_slice(head);
+    let n = put_num(&mut cmd, head.len(), ch);
+    send_cli(&cmd[..n]);
+    say(b"voipcli: channel silenced\n");
+    0
+}
+
 /// Ring the phone, wait for it to be picked up, then speak the file into it.
 ///
 /// Off-hook is detected by watching vgw_app's own channel record: when the handset comes
@@ -813,6 +856,12 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
 ");
         }
         return 0;
+    }
+
+    // --- panic button: silence ring and tones on a channel ---
+    if a1 == b"stop" {
+        let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
+        return stop_channel(ch);
     }
 
     // --- ring, wait for pick-up, then speak ---
