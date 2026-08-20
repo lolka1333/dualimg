@@ -44,6 +44,8 @@ unsafe extern "C" {
     fn time(t: *mut c_long) -> c_long;
     fn localtime(t: *const c_long) -> *const c_int;
     fn ptrace(req: c_int, pid: c_int, addr: c_long, data: c_long) -> c_long;
+    fn getenv(name: *const c_char) -> *const c_char;
+    fn putenv(s: *const c_char) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, opts: c_int) -> c_int;
     fn exit(code: c_int) -> !;
 }
@@ -267,6 +269,12 @@ fn endpt_signal(state: &[u8; ENDPT_STATE_SIZE], signal: u32, value: u32) -> bool
 /// Build the CallerID payload: "MM/DD/HH/MM,  " (14 bytes, from localtime) + number.
 fn build_cid(number: &[u8], buf: &mut [u8; 0x52]) {
     unsafe {
+        // This firmware ships no /etc/TZ and no /etc/localtime, so uClibc's localtime()
+        // silently reports UTC and the phone would log the call 3 hours early. Default to
+        // Moscow unless the caller already exported a TZ of their own.
+        if getenv(b"TZ ".as_ptr() as *const c_char).is_null() {
+            putenv(b"TZ=MSK-3 ".as_ptr() as *const c_char);
+        }
         let t = time(core::ptr::null_mut());
         let tm = localtime(&t as *const c_long);
         let (mon, mday, hour, min) = if tm.is_null() {
