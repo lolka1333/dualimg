@@ -295,7 +295,8 @@ fn chan_info(ch: u32) -> Option<ChanInfo> {
 /// Feed one already-built RTP packet into an EXISTING connection. We never create or
 /// destroy connections — vgw_app stays the owner of the call, we only hand its DSP more
 /// audio, so there is no state machine to confuse.
-fn send_packet(info: &ChanInfo, ch: u32, pkt: &[u8]) -> bool {
+/// Returns the driver status: 0 = taken, 9 = accepted-but-dropped, u32::MAX = ioctl error.
+fn send_packet(info: &ChanInfo, ch: u32, pkt: &[u8]) -> u32 {
     unsafe {
         let fd = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
         if fd < 0 {
@@ -314,7 +315,7 @@ fn send_packet(info: &ChanInfo, ch: u32, pkt: &[u8]) -> bool {
         ];
         let rc = ioctl(fd, IOCTL_ENDPT_PACKET, parm.as_mut_ptr() as *mut c_void);
         close(fd);
-        rc == 0 && (parm[6] == 0 || parm[6] == 9)
+        if rc != 0 { u32::MAX } else { parm[6] }
     }
 }
 
@@ -618,6 +619,8 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
         let mut seq: u16 = 0;
         let mut ts: u32 = 0;
         let mut sent: u32 = 0;
+        let mut taken: u32 = 0;
+        let mut dropped: u32 = 0;
         loop {
             let n = read(
                 fd,
@@ -635,10 +638,14 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             }
             pkt[2..4].copy_from_slice(&seq.to_be_bytes());
             pkt[4..8].copy_from_slice(&ts.to_be_bytes());
-            if !send_packet(info, ch, &pkt) {
-                say(b"voipcli: the DSP refused a packet, stopping\n");
-                close(fd);
-                return 7;
+            match send_packet(info, ch, &pkt) {
+                0 => taken = taken.wrapping_add(1),
+                9 => dropped = dropped.wrapping_add(1),
+                _ => {
+                    say(b"voipcli: the DSP refused a packet, stopping\n");
+                    close(fd);
+                    return 7;
+                }
             }
             seq = seq.wrapping_add(1);
             ts = ts.wrapping_add(RTP_PAYLOAD as u32);
@@ -646,7 +653,20 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             usleep(20000); // one packet per 20 ms, or the audio runs fast
         }
         close(fd);
-        say(b"voipcli: finished\n");
+        let mut line = [0u8; 80];
+        let h = b"voipcli: finished - taken=";
+        line[..h.len()].copy_from_slice(h);
+        let mut i = put_num(&mut line, h.len(), taken);
+        let h2 = b" dropped=";
+        line[i..i + h2.len()].copy_from_slice(h2);
+        i += h2.len();
+        i = put_num(&mut line, i, dropped);
+        line[i] = b'\n';
+        i += 1;
+        say(&line[..i]);
+        if taken == 0 && dropped > 0 {
+            say(b"(every packet came back status 9: the DSP is accepting and discarding them)\n");
+        }
         let _ = sent;
         0
     }
