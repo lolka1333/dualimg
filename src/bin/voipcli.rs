@@ -743,8 +743,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         line[i..i + l3.len()].copy_from_slice(l3);
         i += l3.len();
         i = put_num(&mut line, i, info.ept_idx);
-        line[i] = b'
-';
+        line[i] = b'\n';
         i += 1;
         say(&line[..i]);
         if info.cnx_id < 0 {
