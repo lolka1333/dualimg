@@ -92,7 +92,10 @@ const EPSIG_CALLERID: u32 = 0x3B;
 // call, so the same items can be re-set live — no read-only file to patch, no reflash.
 const IOCTL_ENDPT_PROVSET: c_long = 0xc018_d11du32 as i32 as c_long;
 const PROV_RING_VOLTAGE: u32 = 0x0a2b; // volts, ships at 57
-const RING_VOLTAGE_MAX: u32 = 90; // SLIC ceiling; the profile enables HighVoltageRingSupport
+const RING_VOLTAGE_MAX: u32 = 95; // real FXS hardware tops out around here (ETSI ring is <=90 Vrms)
+const PROV_RING_WAVEFORM: u32 = 0x0a2a;
+const PROV_RING_FREQ: u32 = 0x0a29;
+const PROV_HV_RING: u32 = 0x0a28;
 // ---- SIP channel: vgw's own stack listens on the operator VLAN address ----
 const AF_INET: c_int = 2;
 const SOL_SOCKET: c_int = 0xffff; // MIPS
@@ -888,6 +891,23 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         return 0;
     }
 
+    // --- everything that makes the bell louder, in one go ---
+    if a1 == b"ringmax" {
+        let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
+        // High-voltage ringing must be enabled before the voltage itself means anything;
+        // a trapezoid carries more energy than a sine at the same peak, and 25 Hz is what
+        // Russian bells are tuned for. Voltage last, so it lands on the final waveform.
+        prov_set(ch, PROV_HV_RING, 1);
+        prov_set(ch, PROV_RING_WAVEFORM, 1);
+        prov_set(ch, PROV_RING_FREQ, 25);
+        if !prov_set(ch, PROV_RING_VOLTAGE, RING_VOLTAGE_MAX) {
+            return 7;
+        }
+        say(b"voipcli: ring set to 95 V, trapezoid, 25 Hz
+");
+        return 0;
+    }
+
     // --- panic button: silence ring and tones on a channel ---
     if a1 == b"stop" {
         let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
@@ -937,7 +957,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             }
             let mut v = atoi(arg(argv, 3));
             if v > RING_VOLTAGE_MAX {
-                say(b"voipcli: clamping to the 90 V SLIC ceiling
+                say(b"voipcli: clamping to the 95 V SLIC ceiling
 ");
                 v = RING_VOLTAGE_MAX;
             }
