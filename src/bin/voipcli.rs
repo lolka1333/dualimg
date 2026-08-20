@@ -746,6 +746,16 @@ fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
     let n = put_num(&mut cmd, head.len(), ch);
     send_cli(&cmd[..n]);
     unsafe { usleep(300_000) };
+    // The connection the line manager opens for a dial tone does not render incoming
+    // audio: dspif_ch_active_RTP is what puts it in mode 2 (send+receive) through
+    // vrgEndptModifyConnection. Without this the DSP accepts our packets and drops them,
+    // which is exactly the silent-but-successful run seen before.
+    let mut act = [0u8; 32];
+    let ah = b"dsp activateRTP ";
+    act[..ah.len()].copy_from_slice(ah);
+    let an = put_num(&mut act, ah.len(), ch);
+    send_cli(&act[..an]);
+    unsafe { usleep(400_000) };
 
     say(b"voipcli: picked up - playing\n");
     play_on(&live, ch, path, 8)
