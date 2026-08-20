@@ -69,6 +69,7 @@ const ENDPT_OBJ_STATE_BASE: c_long = 0x005f_3ff0;
 const ENDPT_STATE_SIZE: usize = 12; // bytes per endpoint entry
 const IOCTL_ENDPT_SIGNAL: c_long = 0xc024_d105u32 as i32 as c_long;
 const EPSIG_RINGING: u32 = 0x0F;
+const EPSIG_RINGING_INT: u32 = 0x10; // internal-call variant used by ring_callerid_off
 const EPSIG_CALLERID: u32 = 0x3B;
 const O_RDONLY: c_int = 0;
 const O_RDWR: c_int = 2;
@@ -372,26 +373,31 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             return 4;
         }
         if a1 == b"ringoff" {
-            return if endpt_signal(&state, EPSIG_RINGING, 0) {
-                0
-            } else {
-                5
-            };
+            // dspif_ch_ring_callerid_off(): signal 0x0F (external) or 0x10 (internal), value 0.
+            // Send both so a ring started either way is stopped.
+            let a = endpt_signal(&state, EPSIG_RINGING, 0);
+            let b = endpt_signal(&state, EPSIG_RINGING_INT, 0);
+            return if a || b { 0 } else { 5 };
         }
-        // ring first, then (for `cid`) the caller-id frame — same order as dspif_ch_ring_callerid
-        if !endpt_signal(&state, EPSIG_RINGING, 1) {
-            return 5;
-        }
-        if a1 == b"cid" {
+        // Mark the channel as ringing exactly like dspif_ch_ring_callerid does...
+        endpt_signal(&state, EPSIG_RINGING, 1);
+        // ...then hand over the caller-id frame. In CIDMode=onhook_ring the driver runs the
+        // WHOLE incoming-call sequence off this one signal (ring, pause, FSK, ring again),
+        // which is why a bare 0x0F is silent while 0x3B actually rings the bell. `ring` is
+        // therefore the same call with an empty number: it rings without showing a caller.
+        let mut cid = [0u8; 0x52];
+        let number: &[u8] = if a1 == b"cid" {
             if argc < 4 {
                 say(b"voipcli: cid needs a number\n");
                 return 1;
             }
-            let mut cid = [0u8; 0x52];
-            build_cid(arg(argv, 3), &mut cid);
-            if !endpt_signal(&state, EPSIG_CALLERID, cid.as_ptr() as u32) {
-                return 6;
-            }
+            arg(argv, 3)
+        } else {
+            b""
+        };
+        build_cid(number, &mut cid);
+        if !endpt_signal(&state, EPSIG_CALLERID, cid.as_ptr() as u32) {
+            return 6;
         }
         return 0;
     }
