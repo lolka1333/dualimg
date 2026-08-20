@@ -598,6 +598,11 @@ fn play_file(ch: u32, path: &[u8], pt: u32) -> c_int {
         say(b"voipcli: no active call on this channel - pick up the handset first\n");
         return 5;
     }
+    play_on(&info, ch, path, pt)
+}
+
+/// Stream the file into a connection that was already looked up.
+fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
     unsafe {
         let fd = open(path.as_ptr() as *const c_char, O_RDONLY);
         if fd < 0 {
@@ -629,7 +634,7 @@ fn play_file(ch: u32, path: &[u8], pt: u32) -> c_int {
             }
             pkt[2..4].copy_from_slice(&seq.to_be_bytes());
             pkt[4..8].copy_from_slice(&ts.to_be_bytes());
-            if !send_packet(&info, ch, &pkt) {
+            if !send_packet(info, ch, &pkt) {
                 say(b"voipcli: the DSP refused a packet, stopping\n");
                 close(fd);
                 return 7;
@@ -644,6 +649,63 @@ fn play_file(ch: u32, path: &[u8], pt: u32) -> c_int {
         let _ = sent;
         0
     }
+}
+
+/// Ring the phone, wait for it to be picked up, then speak the file into it.
+///
+/// Off-hook is detected by watching vgw_app's own channel record: when the handset comes
+/// up its LSM opens the DSP channel (dspif_ch_open sets cnx_id = channel and opened = 1),
+/// which is exactly the connection we are allowed to feed. We stop the ring, silence the
+/// dial tone vgw starts playing, and stream the audio in.
+fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
+    let info = match chan_info(ch) {
+        Some(i) => i,
+        None => return 4,
+    };
+    // start ringing with the caller id
+    endpt_signal(&info.state, EPSIG_RINGING, 1);
+    let mut cid = [0u8; 0x52];
+    build_cid(number, &mut cid);
+    if !endpt_signal(&info.state, EPSIG_CALLERID, cid.as_ptr() as u32) {
+        return 5;
+    }
+    say(b"voipcli: ringing - pick up the handset\n");
+
+    // wait for off-hook (~40 s), polling gently so vgw is barely disturbed
+    let mut live: Option<ChanInfo> = None;
+    let mut tries = 0;
+    while tries < 80 {
+        unsafe { usleep(500_000) };
+        tries += 1;
+        if let Some(i) = chan_info(ch) {
+            if i.opened != 0 && i.cnx_id >= 0 {
+                live = Some(i);
+                break;
+            }
+        }
+    }
+    let live = match live {
+        Some(i) => i,
+        None => {
+            endpt_signal(&info.state, EPSIG_RINGING, 0);
+            endpt_signal(&info.state, EPSIG_RINGING_INT, 0);
+            say(b"voipcli: nobody picked up\n");
+            return 6;
+        }
+    };
+
+    // stop the ring and the dial tone the line manager starts on off-hook
+    endpt_signal(&live.state, EPSIG_RINGING, 0);
+    endpt_signal(&live.state, EPSIG_RINGING_INT, 0);
+    let mut cmd = [0u8; 32];
+    let head = b"dsp tone_off ";
+    cmd[..head.len()].copy_from_slice(head);
+    let n = put_num(&mut cmd, head.len(), ch);
+    send_cli(&cmd[..n]);
+    unsafe { usleep(300_000) };
+
+    say(b"voipcli: picked up - playing\n");
+    play_on(&live, ch, path, 8)
 }
 
 /// Legacy path: hand a command line to vgw's CLI over the CGI socket.
@@ -751,6 +813,21 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
 ");
         }
         return 0;
+    }
+
+    // --- ring, wait for pick-up, then speak ---
+    if a1 == b"announce" {
+        if argc < 5 {
+            say(b"usage: voipcli announce <ch> <caller-number> <file.alaw>
+");
+            return 1;
+        }
+        let ch = atoi(arg(argv, 2));
+        let raw = arg(argv, 4);
+        let mut path = [0u8; 128];
+        let n = if raw.len() > 126 { 126 } else { raw.len() };
+        path[..n].copy_from_slice(&raw[..n]);
+        return announce(ch, arg(argv, 3), &path);
     }
 
     // --- play raw G.711 into a live call ---
