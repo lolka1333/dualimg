@@ -330,7 +330,10 @@ struct Buf {
 }
 impl Buf {
     fn new() -> Buf {
-        Buf { b: [0u8; 1400], n: 0 }
+        Buf {
+            b: [0u8; 1400],
+            n: 0,
+        }
     }
     fn s(&mut self, x: &[u8]) {
         let room = self.b.len() - self.n;
@@ -341,55 +344,50 @@ impl Buf {
     fn d(&mut self, v: u32) {
         let mut tmp = [0u8; 12];
         let e = put_num(&mut tmp, 0, v);
-        let (head, _) = tmp.split_at(e);
         let mut copy = [0u8; 12];
-        copy[..e].copy_from_slice(head);
+        copy[..e].copy_from_slice(&tmp[..e]);
         self.s(&copy[..e]);
     }
 }
 
-/// parse a dotted-quad into network-order u32
+/// parse a dotted-quad into a host-order u32
 fn parse_ip(s: &[u8]) -> u32 {
     let mut parts = [0u32; 4];
     let mut idx = 0usize;
     let mut cur = 0u32;
-    let mut seen = false;
     for &c in s {
         if c >= b'0' && c <= b'9' {
             cur = cur * 10 + (c - b'0') as u32;
-            seen = true;
         } else if c == b'.' {
             if idx < 4 {
                 parts[idx] = cur;
             }
             idx += 1;
             cur = 0;
-            seen = false;
         } else {
             break;
         }
     }
-    if seen && idx < 4 {
+    if idx < 4 {
         parts[idx] = cur;
     }
     (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
 }
 
 /// Send a SIP INVITE straight at vgw's own stack. It listens on the operator-VLAN
-/// address (netstat shows 10.254.55.17:5060), and the box can talk to its own address,
-/// so this arrives as a genuine incoming call: the phone rings through the full call
-/// manager and the caller-id is logged the way a real call is. Combined with an
+/// address (netstat shows 10.254.55.17:5060) and the box can address itself, so the
+/// request arrives as a genuine incoming call: the phone rings through the whole call
+/// manager and the caller-id is journalled the way a real call is. Combined with an
 /// unconditional call-forward (`vgw sip fw all 0 1 <number>`) the very same INVITE makes
-/// the router place a REAL outbound call — dialling from the shell without patching vgw.
+/// the router place a REAL outbound call — dialling from the shell, no patched binary.
 fn sip_invite(dest: &[u8], to_user: &[u8], from_user: &[u8], host: &[u8]) -> c_int {
     unsafe {
         let fd = socket(AF_INET, SOCK_DGRAM, 0);
         if fd < 0 {
-            say(b"voipcli: socket failed
-");
+            say(b"voipcli: socket failed\n");
             return 1;
         }
-        // bind a fixed local port so Contact/Via are truthful
+        // bind a fixed local port so Via/Contact are truthful
         let local = SockaddrIn {
             sin_family: AF_INET as u16,
             sin_port: LOCAL_SIP_PORT.to_be(),
@@ -397,71 +395,52 @@ fn sip_invite(dest: &[u8], to_user: &[u8], from_user: &[u8], host: &[u8]) -> c_i
             sin_zero: [0u8; 8],
         };
         bind(fd, &local as *const SockaddrIn as *const c_void, 16);
-        // 3-second receive timeout so we can show the stack's answer
+        // short receive timeout so we can show whatever the stack answers
         let tv: [u32; 2] = [3, 0];
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv.as_ptr() as *const c_void, 8);
 
         let tag = (time(core::ptr::null_mut()) as u32) ^ (getpid() as u32);
 
-        // --- SDP body first, we need its length for Content-Length ---
+        // SDP body first — its length goes into Content-Length
         let mut sdp = Buf::new();
-        sdp.s(b"v=0
-o=- 1 1 IN IP4 ");
+        sdp.s(b"v=0\r\no=- 1 1 IN IP4 ");
         sdp.s(dest);
-        sdp.s(b"
-s=-
-c=IN IP4 ");
+        sdp.s(b"\r\ns=-\r\nc=IN IP4 ");
         sdp.s(dest);
-        sdp.s(b"
-t=0 0
-m=audio 40000 RTP/AVP 8 0
-a=rtpmap:8 PCMA/8000
-a=rtpmap:0 PCMU/8000
-");
+        sdp.s(b"\r\nt=0 0\r\nm=audio 40000 RTP/AVP 8 0\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\n");
 
         let mut m = Buf::new();
         m.s(b"INVITE sip:");
         m.s(to_user);
         m.s(b"@");
         m.s(host);
-        m.s(b" SIP/2.0
-Via: SIP/2.0/UDP ");
+        m.s(b" SIP/2.0\r\nVia: SIP/2.0/UDP ");
         m.s(dest);
         m.s(b":");
         m.d(LOCAL_SIP_PORT as u32);
         m.s(b";branch=z9hG4bK");
         m.d(tag);
-        m.s(b"
-Max-Forwards: 70
-From: <sip:");
+        m.s(b"\r\nMax-Forwards: 70\r\nFrom: <sip:");
         m.s(from_user);
         m.s(b"@");
         m.s(host);
         m.s(b">;tag=");
         m.d(tag);
-        m.s(b"
-To: <sip:");
+        m.s(b"\r\nTo: <sip:");
         m.s(to_user);
         m.s(b"@");
         m.s(host);
-        m.s(b">
-Call-ID: ");
+        m.s(b">\r\nCall-ID: ");
         m.d(tag);
-        m.s(b"@voipcli
-CSeq: 1 INVITE
-Contact: <sip:");
+        m.s(b"@voipcli\r\nCSeq: 1 INVITE\r\nContact: <sip:");
         m.s(from_user);
         m.s(b"@");
         m.s(dest);
         m.s(b":");
         m.d(LOCAL_SIP_PORT as u32);
-        m.s(b">
-Content-Type: application/sdp
-Content-Length: ");
+        m.s(b">\r\nContent-Type: application/sdp\r\nContent-Length: ");
         m.d(sdp.n as u32);
-        m.s(b"
-
-");
+        m.s(b"\r\n\r\n");
         let head = m.n;
         let body = sdp.n;
         m.b[head..head + body].copy_from_slice(&sdp.b[..body]);
@@ -482,22 +461,18 @@ Content-Length: ");
             16,
         );
         if sent < 0 {
-            say(b"voipcli: sendto failed
-");
+            say(b"voipcli: sendto failed\n");
             close(fd);
             return 2;
         }
-        say(b"voipcli: INVITE sent, waiting for the stack to answer...
-");
+        say(b"voipcli: INVITE sent, waiting for an answer...\n");
         let mut rb = [0u8; 1400];
         let got = recv(fd, rb.as_mut_ptr() as *mut c_void, 1400, 0);
         if got > 0 {
             write(1, rb.as_ptr() as *const c_void, got as usize);
-            say(b"
-");
+            say(b"\n");
         } else {
-            say(b"voipcli: no answer (the stack may have ignored it)
-");
+            say(b"voipcli: no answer (the stack ignored it, or it filters by source)\n");
         }
         close(fd);
         0
@@ -577,12 +552,19 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     // --- SIP: hand an INVITE to vgw's own stack (real incoming call / dial via forward) ---
     if a1 == b"invite" {
         if argc < 4 {
-            say(b"usage: voipcli invite <to-number> <from-number> [stack-ip] [host]
-");
+            say(b"usage: voipcli invite <to-number> <from-number> [stack-ip] [host]\n");
             return 1;
         }
-        let dest = if argc >= 5 { arg(argv, 4) } else { b"10.254.55.17" as &[u8] };
-        let host = if argc >= 6 { arg(argv, 5) } else { b"msk.ims.mgts.ru" as &[u8] };
+        let dest = if argc >= 5 {
+            arg(argv, 4)
+        } else {
+            b"10.254.55.17" as &[u8]
+        };
+        let host = if argc >= 6 {
+            arg(argv, 5)
+        } else {
+            b"msk.ims.mgts.ru" as &[u8]
+        };
         return sip_invite(dest, arg(argv, 2), arg(argv, 3), host);
     }
 
