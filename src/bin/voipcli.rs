@@ -52,6 +52,7 @@ unsafe extern "C" {
     fn recv(fd: c_int, buf: *mut c_void, n: usize, fl: c_int) -> isize;
     fn setsockopt(fd: c_int, lvl: c_int, opt: c_int, val: *const c_void, len: u32) -> c_int;
     fn getpid() -> c_int;
+    fn usleep(us: u32) -> c_int;
     fn exit(code: c_int) -> !;
 }
 
@@ -74,6 +75,13 @@ const VGW_LOCK: &[u8] = b"/var/voice/vgw.lock\0";
 // Kept as a constant so we never have to fetch the pointer at runtime.
 const ENDPT_OBJ_STATE_BASE: c_long = 0x005f_3ff0;
 const ENDPT_STATE_SIZE: usize = 12; // bytes per endpoint entry
+// vgw_app keeps one 0xb80-byte record per voice channel; the fields we need sit at the
+// front of it (seen in dspif_ch_send_packet_to_dsp / dspif_ch_ring_callerid).
+const CHAN_TABLE_BASE: c_long = 0x0058_896c;
+const CHAN_STRIDE: c_long = 0xb80;
+const IOCTL_ENDPT_PACKET: c_long = 0xc01c_d10bu32 as i32 as c_long;
+const RTP_PAYLOAD: usize = 160; // 20 ms of 8 kHz G.711
+const RTP_HDR: usize = 12;
 const IOCTL_ENDPT_SIGNAL: c_long = 0xc024_d105u32 as i32 as c_long;
 const EPSIG_RINGING: u32 = 0x0F;
 const EPSIG_RINGING_INT: u32 = 0x10; // internal-call variant used by ring_callerid_off
@@ -192,7 +200,7 @@ fn put_num(buf: &mut [u8], at: usize, mut v: u32) -> usize {
 }
 
 /// Try /proc/<pid>/mem first (cheap, no stop), fall back to ptrace PEEKDATA.
-fn read_remote(pid: c_int, addr: c_long, out: &mut [u8; ENDPT_STATE_SIZE]) -> bool {
+fn read_remote(pid: c_int, addr: c_long, out: &mut [u8]) -> bool {
     unsafe {
         // --- path 1: /proc/<pid>/mem ---
         let mut path = [0u8; 32];
@@ -204,10 +212,8 @@ fn read_remote(pid: c_int, addr: c_long, out: &mut [u8; ENDPT_STATE_SIZE]) -> bo
 
         let mf = open(path.as_ptr() as *const c_char, O_RDONLY);
         if mf >= 0 {
-            if lseek(mf, addr, 0) >= 0
-                && read(mf, out.as_mut_ptr() as *mut c_void, ENDPT_STATE_SIZE)
-                    == ENDPT_STATE_SIZE as isize
-            {
+            let want = out.len();
+            if lseek(mf, addr, 0) >= 0 && read(mf, out.as_mut_ptr() as *mut c_void, want) == want as isize {
                 close(mf);
                 return true;
             }
@@ -223,7 +229,8 @@ fn read_remote(pid: c_int, addr: c_long, out: &mut [u8; ENDPT_STATE_SIZE]) -> bo
         waitpid(pid, &mut st as *mut c_int, 0);
         let mut ok = true;
         let mut w = 0usize;
-        while w < ENDPT_STATE_SIZE {
+        let want = out.len();
+        while w < want {
             let word = ptrace(PTRACE_PEEKDATA, pid, addr + w as c_long, 0);
             if word == -1 {
                 ok = false;
@@ -241,14 +248,73 @@ fn read_remote(pid: c_int, addr: c_long, out: &mut [u8; ENDPT_STATE_SIZE]) -> bo
     }
 }
 
-/// Read the live 12-byte ENDPT_STATE for `ch` out of the running vgw_app.
-fn fetch_endpt_state(ch: u32, out: &mut [u8; ENDPT_STATE_SIZE]) -> bool {
+/// One voice channel as vgw_app sees it, read straight out of its memory.
+struct ChanInfo {
+    opened: u32,
+    cnx_id: i32,
+    ept_idx: u32,
+    state: [u8; ENDPT_STATE_SIZE],
+}
+
+/// Read a channel's live record. The endpoint object is NOT indexed by the channel
+/// number but by the channel's ept_idx — getting that wrong is why a bare `ring 0`
+/// stayed silent while `ring 1` happened to hit the right slot.
+fn chan_info(ch: u32) -> Option<ChanInfo> {
     let pid = vgw_pid();
     if pid <= 0 {
-        return false;
+        return None;
     }
-    let addr = ENDPT_OBJ_STATE_BASE + (ch as c_long) * (ENDPT_STATE_SIZE as c_long);
-    read_remote(pid, addr, out)
+    let mut hdr = [0u8; 16];
+    if !read_remote(pid, CHAN_TABLE_BASE + (ch as c_long) * CHAN_STRIDE, &mut hdr) {
+        say(b"voipcli: cannot read the channel record from vgw_app\n");
+        return None;
+    }
+    let opened = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let cnx_id = i32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    let ept_idx = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
+    let mut state = [0u8; ENDPT_STATE_SIZE];
+    if ept_idx > 7
+        || !read_remote(
+            pid,
+            ENDPT_OBJ_STATE_BASE + (ept_idx as c_long) * (ENDPT_STATE_SIZE as c_long),
+            &mut state,
+        )
+    {
+        say(b"voipcli: cannot read the endpoint state\n");
+        return None;
+    }
+    Some(ChanInfo {
+        opened,
+        cnx_id,
+        ept_idx,
+        state,
+    })
+}
+
+/// Feed one already-built RTP packet into an EXISTING connection. We never create or
+/// destroy connections — vgw_app stays the owner of the call, we only hand its DSP more
+/// audio, so there is no state machine to confuse.
+fn send_packet(info: &ChanInfo, ch: u32, pkt: &[u8]) -> bool {
+    unsafe {
+        let fd = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
+        if fd < 0 {
+            return false;
+        }
+        // EPPACKET { u32 mediaType; void *data; } — mediaType 0 = RTP (payload_type 1 - 1)
+        let eppacket: [u32; 2] = [0, pkt.as_ptr() as u32];
+        let mut parm: [u32; 7] = [
+            0x1c,
+            info.state.as_ptr() as u32,
+            info.cnx_id as u32,
+            eppacket.as_ptr() as u32,
+            pkt.len() as u32,
+            ch,
+            8,
+        ];
+        let rc = ioctl(fd, IOCTL_ENDPT_PACKET, parm.as_mut_ptr() as *mut c_void);
+        close(fd);
+        rc == 0 && (parm[6] == 0 || parm[6] == 9)
+    }
 }
 
 /// Issue one endptSignal ioctl. `value` is either a scalar or a pointer (CallerID buffer).
@@ -520,6 +586,66 @@ fn prov_set(ch: u32, item: u32, value: u32) -> bool {
     }
 }
 
+/// Stream a raw G.711 file into a live call: 160 bytes (20 ms) per RTP packet.
+/// Refuses unless vgw_app already has a connection up on the channel — that interlock is
+/// what keeps us from ever touching its call state.
+fn play_file(ch: u32, path: &[u8], pt: u32) -> c_int {
+    let info = match chan_info(ch) {
+        Some(i) => i,
+        None => return 4,
+    };
+    if info.cnx_id < 0 || info.opened == 0 {
+        say(b"voipcli: no active call on this channel - pick up the handset first\n");
+        return 5;
+    }
+    unsafe {
+        let fd = open(path.as_ptr() as *const c_char, O_RDONLY);
+        if fd < 0 {
+            say(b"voipcli: cannot open the audio file\n");
+            return 6;
+        }
+        let mut pkt = [0u8; RTP_HDR + RTP_PAYLOAD];
+        pkt[0] = 0x80;
+        pkt[1] = pt as u8;
+        let ssrc: u32 = 0x7601_c11a;
+        pkt[8..12].copy_from_slice(&ssrc.to_be_bytes());
+        let mut seq: u16 = 0;
+        let mut ts: u32 = 0;
+        let mut sent: u32 = 0;
+        loop {
+            let n = read(
+                fd,
+                pkt[RTP_HDR..].as_mut_ptr() as *mut c_void,
+                RTP_PAYLOAD,
+            );
+            if n <= 0 {
+                break;
+            }
+            // pad a short final chunk with A-law silence
+            if (n as usize) < RTP_PAYLOAD {
+                for b in pkt[RTP_HDR + n as usize..].iter_mut() {
+                    *b = 0xd5;
+                }
+            }
+            pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+            pkt[4..8].copy_from_slice(&ts.to_be_bytes());
+            if !send_packet(&info, ch, &pkt) {
+                say(b"voipcli: the DSP refused a packet, stopping\n");
+                close(fd);
+                return 7;
+            }
+            seq = seq.wrapping_add(1);
+            ts = ts.wrapping_add(RTP_PAYLOAD as u32);
+            sent = sent.wrapping_add(1);
+            usleep(20000); // one packet per 20 ms, or the audio runs fast
+        }
+        close(fd);
+        say(b"voipcli: finished\n");
+        let _ = sent;
+        0
+    }
+}
+
 /// Legacy path: hand a command line to vgw's CLI over the CGI socket.
 fn send_cli(cmd: &[u8]) -> c_int {
     let mut msg = [0u8; 136];
@@ -570,10 +696,10 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         if pid <= 0 {
             return 4;
         }
-        let mut state = [0u8; ENDPT_STATE_SIZE];
-        if !fetch_endpt_state(ch, &mut state) {
-            return 4;
-        }
+        let state = match chan_info(ch) {
+            Some(i) => i.state,
+            None => return 4,
+        };
         let hexd = b"0123456789abcdef";
         let mut hx = [0u8; ENDPT_STATE_SIZE * 3 + 8];
         let lbl = b"state: ";
@@ -588,6 +714,61 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         hx[o] = b'\n';
         say(&hx[..o + 1]);
         return 0;
+    }
+
+    // --- read-only: what vgw_app thinks the channel is doing ---
+    if a1 == b"cnx" {
+        let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
+        let info = match chan_info(ch) {
+            Some(i) => i,
+            None => return 4,
+        };
+        let mut line = [0u8; 96];
+        let mut i = 0usize;
+        let l1 = b"opened=";
+        line[i..i + l1.len()].copy_from_slice(l1);
+        i += l1.len();
+        i = put_num(&mut line, i, info.opened);
+        let l2 = b" cnx_id=";
+        line[i..i + l2.len()].copy_from_slice(l2);
+        i += l2.len();
+        if info.cnx_id < 0 {
+            line[i] = b'-';
+            i += 1;
+            i = put_num(&mut line, i, (-info.cnx_id) as u32);
+        } else {
+            i = put_num(&mut line, i, info.cnx_id as u32);
+        }
+        let l3 = b" ept_idx=";
+        line[i..i + l3.len()].copy_from_slice(l3);
+        i += l3.len();
+        i = put_num(&mut line, i, info.ept_idx);
+        line[i] = b'
+';
+        i += 1;
+        say(&line[..i]);
+        if info.cnx_id < 0 {
+            say(b"(cnx_id -1 = no call up; audio can only be injected during a call)
+");
+        }
+        return 0;
+    }
+
+    // --- play raw G.711 into a live call ---
+    if a1 == b"play" {
+        if argc < 4 {
+            say(b"usage: voipcli play <ch> <file.alaw> [payload-type, default 8=A-law]
+");
+            return 1;
+        }
+        let ch = atoi(arg(argv, 2));
+        let pt = if argc >= 5 { atoi(arg(argv, 4)) } else { 8 };
+        // path must be NUL-terminated for open()
+        let raw = arg(argv, 3);
+        let mut path = [0u8; 128];
+        let n = if raw.len() > 126 { 126 } else { raw.len() };
+        path[..n].copy_from_slice(&raw[..n]);
+        return play_file(ch, &path, pt);
     }
 
     // --- provisioning: ring loudness and any other endpoint item, applied live ---
@@ -644,10 +825,10 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     // --- endpoint subcommands (real ring / caller-id) ---
     if a1 == b"ring" || a1 == b"ringoff" || a1 == b"cid" {
         let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
-        let mut state = [0u8; ENDPT_STATE_SIZE];
-        if !fetch_endpt_state(ch, &mut state) {
-            return 4;
-        }
+        let state = match chan_info(ch) {
+            Some(i) => i.state,
+            None => return 4,
+        };
         if a1 == b"ringoff" {
             // dspif_ch_ring_callerid_off(): signal 0x0F (external) or 0x10 (internal), value 0.
             // Send both so a ring started either way is stopped.
