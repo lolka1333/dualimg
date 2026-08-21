@@ -316,6 +316,7 @@ fn lsm_set_connected(ch: u32) -> bool {
 }
 
 /// One voice channel as vgw_app sees it, read straight out of its memory.
+#[derive(Clone, Copy)]
 struct ChanInfo {
     opened: u32,
     cnx_id: i32,
@@ -690,7 +691,8 @@ fn play_file(ch: u32, path: &[u8], pt: u32) -> c_int {
 }
 
 /// Stream the file into a connection that was already looked up.
-fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
+fn play_on(info_in: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
+    let mut info = *info_in;
     unsafe {
         // "-" means stdin, which is how a live stream gets in: the PC pulls it, converts
         // to 8 kHz A-law and pipes it over ssh.
@@ -755,7 +757,7 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             // is busy or resyncing, and bailing on the first one killed the whole session.
             // Report the first unexpected status, keep going, and give up only if it never
             // recovers.
-            match send_packet(ep, info, ch, &pkt) {
+            match send_packet(ep, &info, ch, &pkt) {
                 0 => {
                     taken = taken.wrapping_add(1);
                     refused_run = 0;
@@ -777,11 +779,23 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
                     }
                     refused = refused.wrapping_add(1);
                     refused_run += 1;
-                    if refused_run > 250 {
-                        say(b"voipcli: the DSP kept refusing, stopping\n");
-                        close(ep);
-                        close(fd);
-                        return 7;
+                    // A run of refusals usually means vgw_app rebuilt or dropped the
+                    // connection under us, leaving our cnx_id stale. Re-read the channel
+                    // record and carry on with the new one; only stop once the call is
+                    // really gone.
+                    if refused_run % 25 == 0 {
+                        match chan_info(ch) {
+                            Some(fresh) if fresh.opened != 0 && fresh.cnx_id >= 0 => {
+                                info = fresh;
+                                refused_run = 0;
+                            }
+                            _ => {
+                                say(b"voipcli: the call is gone, stopping\n");
+                                close(ep);
+                                close(fd);
+                                return 7;
+                            }
+                        }
                     }
                 }
             }
@@ -789,17 +803,6 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             ts = ts.wrapping_add(RTP_PAYLOAD as u32);
             sent = sent.wrapping_add(1);
 
-            // To the line manager this is a handset left off-hook without dialling, so it
-            // walks its own script over our audio: dial tone, then reorder, then the
-            // off-hook howler. Silencing the tone generator twice a second keeps each of
-            // those from ever getting going.
-            if sent % 25 == 0 {
-                let mut q = [0u8; 32];
-                let qh = b"dsp tone_off ";
-                q[..qh.len()].copy_from_slice(qh);
-                let qn = put_num(&mut q, qh.len(), ch);
-                send_cli(&q[..qn]);
-            }
             usleep(20000); // one packet per 20 ms, or the audio runs fast
         }
         close(ep);
