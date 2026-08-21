@@ -773,7 +773,7 @@ fn stop_channel(ch: u32) -> c_int {
 /// pipe a stream at it from anywhere on the LAN (`… | nc 192.168.1.254 9999`). Lifting the
 /// handset starts playback, hanging up or ending the stream returns it to waiting — no
 /// permanently open ssh session in the middle.
-fn listen_mode(ch: u32, port: u16) -> c_int {
+fn listen_mode(ch: u32, port: u16, number: &[u8]) -> c_int {
     unsafe {
         let srv = socket(AF_INET, SOCK_STREAM, 0);
         if srv < 0 {
@@ -802,6 +802,18 @@ fn listen_mode(ch: u32, port: u16) -> c_int {
                 continue;
             }
             say(b"voipcli: stream connected\n");
+            // With a caller number given, announce the stream the way a call would arrive:
+            // ring on connect, and let an interrupt silence the bell.
+            if !number.is_empty() {
+                if let Some(i) = chan_info(ch) {
+                    endpt_signal(&i.state, EPSIG_RINGING, 1);
+                    let mut cid = [0u8; 0x52];
+                    build_cid(number, b"", &mut cid);
+                    endpt_signal(&i.state, EPSIG_CALLERID, cid.as_ptr() as u32);
+                    arm_interrupt(ch);
+                    say(b"voipcli: ringing - pick up to listen\n");
+                }
+            }
             // Keep draining while the handset is down, otherwise the sender stalls and we
             // would later play audio that is minutes stale.
             let mut scratch = [0u8; 2048];
@@ -816,6 +828,9 @@ fn listen_mode(ch: u32, port: u16) -> c_int {
             };
             match live {
                 Some(i) => {
+                    RINGING_CH.store(u32::MAX, Ordering::Relaxed);
+                    endpt_signal(&i.state, EPSIG_RINGING, 0);
+                    endpt_signal(&i.state, EPSIG_RINGING_INT, 0);
                     let mut cmd = [0u8; 32];
                     let head = b"dsp tone_off ";
                     cmd[..head.len()].copy_from_slice(head);
@@ -831,7 +846,10 @@ fn listen_mode(ch: u32, port: u16) -> c_int {
                     dup2(client, 0); // hand the socket to the player as stdin
                     play_on(&i, ch, b"-\0", 8);
                 }
-                None => say(b"voipcli: stream ended before the handset came up\n"),
+                None => {
+                    stop_channel(ch);
+                    say(b"voipcli: stream ended before the handset came up\n");
+                }
             }
             close(client);
             say(b"voipcli: back to waiting\n");
@@ -1075,7 +1093,8 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     if a1 == b"listen" {
         let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
         let port = if argc >= 4 { atoi(arg(argv, 3)) as u16 } else { 9999 };
-        return listen_mode(ch, port);
+        let number = if argc >= 5 { arg(argv, 4) } else { b"" as &[u8] };
+        return listen_mode(ch, port, number);
     }
 
     // --- wait for the handset, then play (file or "-" for a live stream on stdin) ---
