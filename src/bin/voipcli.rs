@@ -846,16 +846,25 @@ fn listen_mode(ch: u32, port: u16, number: &[u8]) -> c_int {
             }
             // Keep draining while the handset is down, otherwise the sender stalls and we
             // would later play audio that is minutes stale.
+            // Poll on a timer rather than off the socket: an HLS feed goes quiet for
+            // seconds between segments, and a blocking read meant the handset could be
+            // lifted and put back down without us ever noticing.
+            let tv: [u32; 2] = [0, 200_000];
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, tv.as_ptr() as *const c_void, 8);
             let mut scratch = [0u8; 2048];
             let live = loop {
                 match chan_info(ch) {
                     Some(i) if i.opened != 0 && i.cnx_id >= 0 => break Some(i),
                     _ => {}
                 }
-                if read(client, scratch.as_mut_ptr() as *mut c_void, 2048) <= 0 {
+                // 0 is a closed stream; a negative result is just the timeout firing.
+                if read(client, scratch.as_mut_ptr() as *mut c_void, 2048) == 0 {
                     break None;
                 }
             };
+            // Streaming must block again, or a quiet moment would look like the end.
+            let block: [u32; 2] = [0, 0];
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, block.as_ptr() as *const c_void, 8);
             match live {
                 Some(i) => {
                     RINGING_CH.store(u32::MAX, Ordering::Relaxed);
