@@ -87,6 +87,11 @@ const ENDPT_STATE_SIZE: usize = 12; // bytes per endpoint entry
 const LSM_LINE_BASE: c_long = 0x005f_4b68;
 const LSM_LINE_STRIDE: c_long = 0x87c;
 const LSM_STATE_OFF: c_long = 0x0c;
+// lsm_timer_abort clears the "running" word at line[timer*4 + 0x10], i.e. bytes 0x40 and
+// 0x50 for the two timers. Leaving them set is what let a stale timeout tear the call down
+// about a minute in, since a bare state poke does not do what lsm_stmc_goto does.
+const LSM_TIMER0_ACTIVE: c_long = 0x40;
+const LSM_TIMER1_ACTIVE: c_long = 0x50;
 const LSM_CONNECTED: u32 = 6; // 0 IDLE, 1 DIAL_TONE, 2 COLLECT, 6 CONNECTED, 10 OFFHOOK_ALERT
 const CHAN_TABLE_BASE: c_long = 0x0058_896c;
 const CHAN_STRIDE: c_long = 0xb80;
@@ -308,11 +313,11 @@ fn lsm_set_connected(ch: u32) -> bool {
     if pid <= 0 {
         return false;
     }
-    poke_remote(
-        pid,
-        LSM_LINE_BASE + (ch as c_long) * LSM_LINE_STRIDE + LSM_STATE_OFF,
-        LSM_CONNECTED,
-    )
+    let line = LSM_LINE_BASE + (ch as c_long) * LSM_LINE_STRIDE;
+    // Disarm the pending timers first, exactly as lsm_stmc_goto does, then park the state.
+    poke_remote(pid, line + LSM_TIMER0_ACTIVE, 0);
+    poke_remote(pid, line + LSM_TIMER1_ACTIVE, 0);
+    poke_remote(pid, line + LSM_STATE_OFF, LSM_CONNECTED)
 }
 
 /// One voice channel as vgw_app sees it, read straight out of its memory.
@@ -802,6 +807,11 @@ fn play_on(info_in: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             seq = seq.wrapping_add(1);
             ts = ts.wrapping_add(RTP_PAYLOAD as u32);
             sent = sent.wrapping_add(1);
+            // Re-park every few seconds in case anything re-arms a timer behind us. The
+            // ptrace stop is sub-millisecond, so it costs nothing at this interval.
+            if sent % 250 == 0 {
+                lsm_set_connected(ch);
+            }
 
             usleep(20000); // one packet per 20 ms, or the audio runs fast
         }
