@@ -61,6 +61,7 @@ unsafe extern "C" {
 }
 
 const PTRACE_PEEKDATA: c_int = 2;
+const PTRACE_POKEDATA: c_int = 5;
 const PTRACE_ATTACH: c_int = 16;
 const PTRACE_DETACH: c_int = 17;
 
@@ -81,6 +82,12 @@ const ENDPT_OBJ_STATE_BASE: c_long = 0x005f_3ff0;
 const ENDPT_STATE_SIZE: usize = 12; // bytes per endpoint entry
 // vgw_app keeps one 0xb80-byte record per voice channel; the fields we need sit at the
 // front of it (seen in dspif_ch_send_packet_to_dsp / dspif_ch_ring_callerid).
+// LSM line records: base from the GOT slot 0x53aca0, 0x87c apart. Field layout is visible
+// in lsm_stmc_goto: [0] line, [1] type, [2] previous state, [3] current state.
+const LSM_LINE_BASE: c_long = 0x005f_4b68;
+const LSM_LINE_STRIDE: c_long = 0x87c;
+const LSM_STATE_OFF: c_long = 0x0c;
+const LSM_CONNECTED: u32 = 6; // 0 IDLE, 1 DIAL_TONE, 2 COLLECT, 6 CONNECTED, 10 OFFHOOK_ALERT
 const CHAN_TABLE_BASE: c_long = 0x0058_896c;
 const CHAN_STRIDE: c_long = 0xb80;
 const IOCTL_ENDPT_PACKET: c_long = 0xc01c_d10bu32 as i32 as c_long;
@@ -255,6 +262,57 @@ fn read_remote(pid: c_int, addr: c_long, out: &mut [u8]) -> bool {
         }
         ok
     }
+}
+
+/// Write one word into the running vgw_app.
+fn poke_remote(pid: c_int, addr: c_long, val: u32) -> bool {
+    unsafe {
+        if ptrace(PTRACE_ATTACH, pid, 0, 0) < 0 {
+            say(b"voipcli: ptrace attach failed
+");
+            return false;
+        }
+        let mut st: c_int = 0;
+        waitpid(pid, &mut st as *mut c_int, 0);
+        let rc = ptrace(PTRACE_POKEDATA, pid, addr, val as c_long);
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+        rc >= 0
+    }
+}
+
+/// Read the line's current state out of the LSM record.
+fn lsm_state(ch: u32) -> Option<u32> {
+    let pid = vgw_pid();
+    if pid <= 0 {
+        return None;
+    }
+    let mut w = [0u8; 4];
+    if !read_remote(
+        pid,
+        LSM_LINE_BASE + (ch as c_long) * LSM_LINE_STRIDE + LSM_STATE_OFF,
+        &mut w,
+    ) {
+        return None;
+    }
+    Some(u32::from_be_bytes(w))
+}
+
+/// Tell the line manager the line is in a call.
+///
+/// Left alone it treats an off-hook handset that never dials as abandoned and walks its
+/// own script over our audio — dial tone, reorder, then the off-hook howler. Parking the
+/// state at CONNECTED is how a real call looks to it, so none of that ever starts. Nothing
+/// on flash changes: this is a word in the live process, gone on the next VoIP restart.
+fn lsm_set_connected(ch: u32) -> bool {
+    let pid = vgw_pid();
+    if pid <= 0 {
+        return false;
+    }
+    poke_remote(
+        pid,
+        LSM_LINE_BASE + (ch as c_long) * LSM_LINE_STRIDE + LSM_STATE_OFF,
+        LSM_CONNECTED,
+    )
 }
 
 /// One voice channel as vgw_app sees it, read straight out of its memory.
@@ -893,6 +951,9 @@ fn listen_mode(ch: u32, port: u16, number: &[u8]) -> c_int {
                     let an = put_num(&mut act, ah.len(), ch);
                     send_cli(&act[..an]);
                     usleep(400_000);
+                    if lsm_set_connected(ch) {
+                        say(b"voipcli: line parked in CONNECTED - no tones will start\n");
+                    }
                     say(b"voipcli: off-hook - streaming\n");
                     dup2(client, 0); // hand the socket to the player as stdin
                     play_on(&i, ch, b"-\0", 8);
@@ -1005,6 +1066,10 @@ fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
     let an = put_num(&mut act, ah.len(), ch);
     send_cli(&act[..an]);
     unsafe { usleep(400_000) };
+    if lsm_set_connected(ch) {
+        say(b"voipcli: line parked in CONNECTED - no tones will start\n");
+    }
+    RINGING_CH.store(u32::MAX, Ordering::Relaxed);
 
     say(b"voipcli: picked up - playing\n");
     play_on(&live, ch, path, 8)
@@ -1132,6 +1197,41 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         say(b"voipcli: ring set to 95 V, trapezoid, 25 Hz
 ");
         return 0;
+    }
+
+    // --- inspect or park the line manager's state ---
+    if a1 == b"lsm" {
+        let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
+        if argc >= 4 {
+            let pid = vgw_pid();
+            if pid <= 0 {
+                return 4;
+            }
+            if !poke_remote(
+                pid,
+                LSM_LINE_BASE + (ch as c_long) * LSM_LINE_STRIDE + LSM_STATE_OFF,
+                atoi(arg(argv, 3)),
+            ) {
+                say(b"voipcli: could not write the state
+");
+                return 7;
+            }
+        }
+        return match lsm_state(ch) {
+            Some(v) => {
+                let mut m = [0u8; 80];
+                let h = b"lsm state=";
+                m[..h.len()].copy_from_slice(h);
+                let mut k = put_num(&mut m, h.len(), v);
+                let t = b"  (0 idle, 1 dial-tone, 2 collect, 6 connected, 10 howler)
+";
+                m[k..k + t.len()].copy_from_slice(t);
+                k += t.len();
+                say(&m[..k]);
+                0
+            }
+            None => 4,
+        };
     }
 
     // --- panic button: silence ring and tones on a channel ---
