@@ -1106,9 +1106,38 @@ fn record_mic(ch: u32, path: &[u8], secs: u32) -> c_int {
             say(b"voipcli: cannot open /dev/bcmendpoint0\n");
             return 6;
         }
-        let out = creat(path.as_ptr() as *const c_char, 0o644);
+        // A destination of tcp:<ip>:<port> streams straight to the PC instead of leaving a
+        // file on a router whose /var is RAM anyway.
+        let out = if path[0] == b't' && path[1] == b'c' && path[2] == b'p' && path[3] == b':' {
+            let mut i = 4usize;
+            let start = i;
+            while path[i] != b':' && path[i] != 0 {
+                i += 1;
+            }
+            let ip = parse_ip(&path[start..i]);
+            let port = if path[i] == b':' {
+                atoi(&path[i + 1..])
+            } else {
+                0
+            } as u16;
+            let sk = socket(AF_INET, SOCK_STREAM, 0);
+            let peer = SockaddrIn {
+                sin_family: AF_INET as u16,
+                sin_port: port.to_be(),
+                sin_addr: ip.to_be(),
+                sin_zero: [0u8; 8],
+            };
+            if sk < 0 || connect(sk, &peer as *const SockaddrIn as *const c_void, 16) < 0 {
+                say(b"voipcli: cannot reach the collector - is it listening?\n");
+                close(ep);
+                return 6;
+            }
+            sk
+        } else {
+            creat(path.as_ptr() as *const c_char, 0o644)
+        };
         if out < 0 {
-            say(b"voipcli: cannot create the output file\n");
+            say(b"voipcli: cannot open the destination\n");
             close(ep);
             return 6;
         }
