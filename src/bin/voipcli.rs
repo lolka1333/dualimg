@@ -54,6 +54,9 @@ unsafe extern "C" {
     fn getpid() -> c_int;
     fn usleep(us: u32) -> c_int;
     fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+    fn listen(fd: c_int, backlog: c_int) -> c_int;
+    fn accept(fd: c_int, addr: *mut c_void, len: *mut u32) -> c_int;
+    fn dup2(old: c_int, new: c_int) -> c_int;
     fn exit(code: c_int) -> !;
 }
 
@@ -100,6 +103,8 @@ const PROV_HV_RING: u32 = 0x0a28;
 const AF_INET: c_int = 2;
 const SOL_SOCKET: c_int = 0xffff; // MIPS
 const SO_RCVTIMEO: c_int = 0x1006; // MIPS
+const SOCK_STREAM: c_int = 2; // MIPS again: STREAM=2, DGRAM=1
+const SO_REUSEADDR: c_int = 0x0004;
 const SIP_PORT: u16 = 5060;
 const LOCAL_SIP_PORT: u16 = 5070;
 const O_RDONLY: c_int = 0;
@@ -764,6 +769,76 @@ fn stop_channel(ch: u32) -> c_int {
     0
 }
 
+/// Serve audio to the handset over a TCP port: run this once on the router, then just
+/// pipe a stream at it from anywhere on the LAN (`… | nc 192.168.1.254 9999`). Lifting the
+/// handset starts playback, hanging up or ending the stream returns it to waiting — no
+/// permanently open ssh session in the middle.
+fn listen_mode(ch: u32, port: u16) -> c_int {
+    unsafe {
+        let srv = socket(AF_INET, SOCK_STREAM, 0);
+        if srv < 0 {
+            say(b"voipcli: socket failed\n");
+            return 1;
+        }
+        let one: u32 = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one as *const u32 as *const c_void, 4);
+        let addr = SockaddrIn {
+            sin_family: AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: 0,
+            sin_zero: [0u8; 8],
+        };
+        if bind(srv, &addr as *const SockaddrIn as *const c_void, 16) < 0 {
+            say(b"voipcli: cannot bind the port\n");
+            close(srv);
+            return 2;
+        }
+        listen(srv, 1);
+        say(b"voipcli: listening - pipe audio at this port, then lift the handset\n");
+
+        loop {
+            let client = accept(srv, core::ptr::null_mut(), core::ptr::null_mut());
+            if client < 0 {
+                continue;
+            }
+            say(b"voipcli: stream connected\n");
+            // Keep draining while the handset is down, otherwise the sender stalls and we
+            // would later play audio that is minutes stale.
+            let mut scratch = [0u8; 2048];
+            let live = loop {
+                match chan_info(ch) {
+                    Some(i) if i.opened != 0 && i.cnx_id >= 0 => break Some(i),
+                    _ => {}
+                }
+                if read(client, scratch.as_mut_ptr() as *mut c_void, 2048) <= 0 {
+                    break None;
+                }
+            };
+            match live {
+                Some(i) => {
+                    let mut cmd = [0u8; 32];
+                    let head = b"dsp tone_off ";
+                    cmd[..head.len()].copy_from_slice(head);
+                    let n = put_num(&mut cmd, head.len(), ch);
+                    send_cli(&cmd[..n]);
+                    let mut act = [0u8; 32];
+                    let ah = b"dsp activateRTP ";
+                    act[..ah.len()].copy_from_slice(ah);
+                    let an = put_num(&mut act, ah.len(), ch);
+                    send_cli(&act[..an]);
+                    usleep(400_000);
+                    say(b"voipcli: off-hook - streaming\n");
+                    dup2(client, 0); // hand the socket to the player as stdin
+                    play_on(&i, ch, b"-\0", 8);
+                }
+                None => say(b"voipcli: stream ended before the handset came up\n"),
+            }
+            close(client);
+            say(b"voipcli: back to waiting\n");
+        }
+    }
+}
+
 /// Wait for the handset to be lifted, then start playing. Same interlock as everywhere
 /// else: we only ever feed the connection vgw_app itself opens on off-hook.
 fn wait_offhook(ch: u32, path: &[u8]) -> c_int {
@@ -994,6 +1069,13 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     if a1 == b"stop" {
         let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
         return stop_channel(ch);
+    }
+
+    // --- serve a live stream over TCP; no ssh session left hanging open ---
+    if a1 == b"listen" {
+        let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
+        let port = if argc >= 4 { atoi(arg(argv, 3)) as u16 } else { 9999 };
+        return listen_mode(ch, port);
     }
 
     // --- wait for the handset, then play (file or "-" for a live stream on stdin) ---
