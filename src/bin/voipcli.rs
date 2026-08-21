@@ -629,7 +629,13 @@ fn play_file(ch: u32, path: &[u8], pt: u32) -> c_int {
 /// Stream the file into a connection that was already looked up.
 fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
     unsafe {
-        let fd = open(path.as_ptr() as *const c_char, O_RDONLY);
+        // "-" means stdin, which is how a live stream gets in: the PC pulls it, converts
+        // to 8 kHz A-law and pipes it over ssh.
+        let fd = if path[0] == b'-' && path[1] == 0 {
+            0
+        } else {
+            open(path.as_ptr() as *const c_char, O_RDONLY)
+        };
         if fd < 0 {
             say(b"voipcli: cannot open the audio file\n");
             return 6;
@@ -654,14 +660,24 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
         let mut taken: u32 = 0;
         let mut dropped: u32 = 0;
         loop {
-            let n = read(
-                fd,
-                pkt[RTP_HDR..].as_mut_ptr() as *mut c_void,
-                RTP_PAYLOAD,
-            );
-            if n <= 0 {
+            // A pipe returns whatever has arrived so far, so keep asking until the frame
+            // is whole; a short final read is padded, EOF ends the stream.
+            let mut got = 0usize;
+            while got < RTP_PAYLOAD {
+                let n = read(
+                    fd,
+                    pkt[RTP_HDR + got..].as_mut_ptr() as *mut c_void,
+                    RTP_PAYLOAD - got,
+                );
+                if n <= 0 {
+                    break;
+                }
+                got += n as usize;
+            }
+            if got == 0 {
                 break;
             }
+            let n = got as isize;
             // pad a short final chunk with A-law silence
             if (n as usize) < RTP_PAYLOAD {
                 for b in pkt[RTP_HDR + n as usize..].iter_mut() {
@@ -746,6 +762,41 @@ fn stop_channel(ch: u32) -> c_int {
     send_cli(&cmd[..n]);
     say(b"voipcli: channel silenced\n");
     0
+}
+
+/// Wait for the handset to be lifted, then start playing. Same interlock as everywhere
+/// else: we only ever feed the connection vgw_app itself opens on off-hook.
+fn wait_offhook(ch: u32, path: &[u8]) -> c_int {
+    say(b"voipcli: waiting for the handset
+");
+    let mut tries = 0;
+    loop {
+        if let Some(i) = chan_info(ch) {
+            if i.opened != 0 && i.cnx_id >= 0 {
+                let mut cmd = [0u8; 32];
+                let head = b"dsp tone_off ";
+                cmd[..head.len()].copy_from_slice(head);
+                let n = put_num(&mut cmd, head.len(), ch);
+                send_cli(&cmd[..n]);
+                let mut act = [0u8; 32];
+                let ah = b"dsp activateRTP ";
+                act[..ah.len()].copy_from_slice(ah);
+                let an = put_num(&mut act, ah.len(), ch);
+                send_cli(&act[..an]);
+                unsafe { usleep(400_000) };
+                say(b"voipcli: off-hook - playing
+");
+                return play_on(&i, ch, path, 8);
+            }
+        }
+        unsafe { usleep(300_000) };
+        tries += 1;
+        if tries > 4000 {
+            say(b"voipcli: gave up waiting
+");
+            return 6;
+        }
+    }
 }
 
 /// Ring the phone, wait for it to be picked up, then speak the file into it.
@@ -943,6 +994,21 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     if a1 == b"stop" {
         let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
         return stop_channel(ch);
+    }
+
+    // --- wait for the handset, then play (file or "-" for a live stream on stdin) ---
+    if a1 == b"wait" {
+        if argc < 4 {
+            say(b"usage: voipcli wait <ch> <file.alaw|->
+");
+            return 1;
+        }
+        let ch = atoi(arg(argv, 2));
+        let raw = arg(argv, 3);
+        let mut path = [0u8; 128];
+        let n = if raw.len() > 126 { 126 } else { raw.len() };
+        path[..n].copy_from_slice(&raw[..n]);
+        return wait_offhook(ch, &path);
     }
 
     // --- ring, wait for pick-up, then speak ---
