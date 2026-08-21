@@ -664,6 +664,8 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
         let mut sent: u32 = 0;
         let mut taken: u32 = 0;
         let mut dropped: u32 = 0;
+        let mut refused: u32 = 0;
+        let mut refused_run: u32 = 0;
         loop {
             // A pipe returns whatever has arrived so far, so keep asking until the frame
             // is whole; a short final read is padded, EOF ends the stream.
@@ -691,14 +693,38 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             }
             pkt[2..4].copy_from_slice(&seq.to_be_bytes());
             pkt[4..8].copy_from_slice(&ts.to_be_bytes());
+            // A live stream must survive the odd refusal: the DSP rejects packets while it
+            // is busy or resyncing, and bailing on the first one killed the whole session.
+            // Report the first unexpected status, keep going, and give up only if it never
+            // recovers.
             match send_packet(ep, info, ch, &pkt) {
-                0 => taken = taken.wrapping_add(1),
-                9 => dropped = dropped.wrapping_add(1),
-                _ => {
-                    say(b"voipcli: the DSP refused a packet, stopping\n");
-                    close(ep);
-                    close(fd);
-                    return 7;
+                0 => {
+                    taken = taken.wrapping_add(1);
+                    refused_run = 0;
+                }
+                9 => {
+                    dropped = dropped.wrapping_add(1);
+                    refused_run = 0;
+                }
+                other => {
+                    if refused == 0 {
+                        let mut m = [0u8; 64];
+                        let h = b"voipcli: DSP status ";
+                        m[..h.len()].copy_from_slice(h);
+                        let mut k = put_num(&mut m, h.len(), other);
+                        let t = b" (continuing)\n";
+                        m[k..k + t.len()].copy_from_slice(t);
+                        k += t.len();
+                        say(&m[..k]);
+                    }
+                    refused = refused.wrapping_add(1);
+                    refused_run += 1;
+                    if refused_run > 250 {
+                        say(b"voipcli: the DSP kept refusing, stopping\n");
+                        close(ep);
+                        close(fd);
+                        return 7;
+                    }
                 }
             }
             seq = seq.wrapping_add(1);
@@ -716,6 +742,10 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
         line[i..i + h2.len()].copy_from_slice(h2);
         i += h2.len();
         i = put_num(&mut line, i, dropped);
+        let h3 = b" refused=";
+        line[i..i + h3.len()].copy_from_slice(h3);
+        i += h3.len();
+        i = put_num(&mut line, i, refused);
         line[i] = b'\n';
         i += 1;
         say(&line[..i]);
