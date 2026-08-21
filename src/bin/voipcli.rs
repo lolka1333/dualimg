@@ -355,7 +355,7 @@ fn endpt_signal(state: &[u8; ENDPT_STATE_SIZE], signal: u32, value: u32) -> bool
 }
 
 /// Build the CallerID payload: "MM/DD/HH/MM,  " (14 bytes, from localtime) + number.
-fn build_cid(number: &[u8], buf: &mut [u8; 0x52]) {
+fn build_cid(number: &[u8], name: &[u8], buf: &mut [u8; 0x52]) {
     unsafe {
         // This firmware ships no /etc/TZ and no /etc/localtime, so uClibc's localtime()
         // silently reports UTC and the phone would log the call 3 hours early. Default to
@@ -386,8 +386,33 @@ fn build_cid(number: &[u8], buf: &mut [u8; 0x52]) {
         buf[11] = b',';
         buf[12] = b' ';
         buf[13] = b' ';
-        let n = if number.len() > 0x44 { 0x44 } else { number.len() };
-        buf[14..14 + n].copy_from_slice(&number[..n]);
+        // The caller field is NOT a bare number. lsm_util_merge_number_name builds
+        // `<digits>,"<name>"` — digits only (everything else is stripped), a comma, then
+        // the name in quotes, an empty name being two spaces. Without that shape the
+        // driver cannot assemble the FSK frame, which is why the handset showed nothing.
+        let mut o = 14usize;
+        for &c in number {
+            if c >= b'0' && c <= b'9' && o < 14 + 0x30 {
+                buf[o] = c;
+                o += 1;
+            }
+        }
+        for &c in b",\"" {
+            if o < 0x50 {
+                buf[o] = c;
+                o += 1;
+            }
+        }
+        let nm: &[u8] = if name.is_empty() { b"  " } else { name };
+        for &c in nm {
+            if o < 0x50 {
+                buf[o] = c;
+                o += 1;
+            }
+        }
+        if o < 0x51 {
+            buf[o] = b'"';
+        }
     }
 }
 
@@ -731,7 +756,7 @@ fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
     // start ringing with the caller id
     endpt_signal(&info.state, EPSIG_RINGING, 1);
     let mut cid = [0u8; 0x52];
-    build_cid(number, &mut cid);
+    build_cid(number, b"", &mut cid);
     if !endpt_signal(&info.state, EPSIG_CALLERID, cid.as_ptr() as u32) {
         return 5;
     }
@@ -1027,7 +1052,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         } else {
             b""
         };
-        build_cid(number, &mut cid);
+        build_cid(number, b"", &mut cid);
         if !endpt_signal(&state, EPSIG_CALLERID, cid.as_ptr() as u32) {
             return 6;
         }
