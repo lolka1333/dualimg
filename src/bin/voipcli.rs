@@ -299,12 +299,8 @@ fn chan_info(ch: u32) -> Option<ChanInfo> {
 /// destroy connections — vgw_app stays the owner of the call, we only hand its DSP more
 /// audio, so there is no state machine to confuse.
 /// Returns the driver status: 0 = taken, 9 = accepted-but-dropped, u32::MAX = ioctl error.
-fn send_packet(info: &ChanInfo, ch: u32, pkt: &[u8]) -> u32 {
+fn send_packet(fd: c_int, info: &ChanInfo, ch: u32, pkt: &[u8]) -> u32 {
     unsafe {
-        let fd = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
-        if fd < 0 {
-            return u32::MAX;
-        }
         // EPPACKET { u32 mediaType; void *data; } — mediaType 0 = RTP (payload_type 1 - 1)
         let eppacket: [u32; 2] = [0, pkt.as_ptr() as u32];
         let mut parm: [u32; 7] = [
@@ -317,7 +313,6 @@ fn send_packet(info: &ChanInfo, ch: u32, pkt: &[u8]) -> u32 {
             8,
         ];
         let rc = ioctl(fd, IOCTL_ENDPT_PACKET, parm.as_mut_ptr() as *mut c_void);
-        close(fd);
         if rc != 0 { u32::MAX } else { parm[6] }
     }
 }
@@ -639,6 +634,15 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             say(b"voipcli: cannot open the audio file\n");
             return 6;
         }
+        // vgw_app holds a single endpoint descriptor for its whole lifetime. Opening and
+        // closing one per packet, as this used to, both wrecks the 20 ms pacing and risks
+        // dropping whatever the driver queues per open.
+        let ep = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
+        if ep < 0 {
+            say(b"voipcli: cannot open /dev/bcmendpoint0\n");
+            close(fd);
+            return 6;
+        }
         let mut pkt = [0u8; RTP_HDR + RTP_PAYLOAD];
         pkt[0] = 0x80;
         pkt[1] = pt as u8;
@@ -666,11 +670,12 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             }
             pkt[2..4].copy_from_slice(&seq.to_be_bytes());
             pkt[4..8].copy_from_slice(&ts.to_be_bytes());
-            match send_packet(info, ch, &pkt) {
+            match send_packet(ep, info, ch, &pkt) {
                 0 => taken = taken.wrapping_add(1),
                 9 => dropped = dropped.wrapping_add(1),
                 _ => {
                     say(b"voipcli: the DSP refused a packet, stopping\n");
+                    close(ep);
                     close(fd);
                     return 7;
                 }
@@ -680,6 +685,7 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             sent = sent.wrapping_add(1);
             usleep(20000); // one packet per 20 ms, or the audio runs fast
         }
+        close(ep);
         close(fd);
         let mut line = [0u8; 80];
         let h = b"voipcli: finished - taken=";
