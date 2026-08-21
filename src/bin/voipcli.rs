@@ -121,6 +121,14 @@ const AF_INET: c_int = 2;
 const SOL_SOCKET: c_int = 0xffff; // MIPS
 const SO_RCVTIMEO: c_int = 0x1006; // MIPS
 const SOCK_STREAM: c_int = 2; // MIPS again: STREAM=2, DGRAM=1
+// A packet socket sees a copy of everything on the wire without taking it away from
+// anyone, which is what makes tapping a genuine call safe: unlike the receive ioctl, the
+// firmware still gets every packet it expects.
+const AF_PACKET: c_int = 17;
+const SOCK_RAW: c_int = 3;
+const ETH_P_ALL: c_int = 3; // already network order on a big-endian box
+const RTP_PORT_LO: u16 = 50000; // rtp_port / rtp_port_range from sip show glb
+const RTP_PORT_HI: u16 = 60000;
 const SO_REUSEADDR: c_int = 0x0004;
 const SIP_PORT: u16 = 5060;
 const LOCAL_SIP_PORT: u16 = 5070;
@@ -1200,6 +1208,87 @@ fn record_mic(ch: u32, path: &[u8], secs: u32) -> c_int {
     }
 }
 
+/// Connect a TCP collector, or -1.
+fn dial_collector(ip: u32, port: u16) -> c_int {
+    unsafe {
+        let sk = socket(AF_INET, SOCK_STREAM, 0);
+        if sk < 0 {
+            return -1;
+        }
+        let peer = SockaddrIn {
+            sin_family: AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: ip.to_be(),
+            sin_zero: [0u8; 8],
+        };
+        if connect(sk, &peer as *const SockaddrIn as *const c_void, 16) < 0 {
+            close(sk);
+            return -1;
+        }
+        sk
+    }
+}
+
+/// Tap a real call by watching the wire rather than the DSP.
+///
+/// The receive ioctl hands each packet to a single reader, so using it during a genuine
+/// call would eat half of what the other side hears. A packet socket only ever gets a
+/// copy, so the call is untouched. Both directions are separated by which side owns the
+/// RTP port and sent to two collectors: far end on `port`, handset on `port + 1`.
+fn tap_call(ip: u32, port: u16) -> c_int {
+    unsafe {
+        let far = dial_collector(ip, port);
+        let mic = dial_collector(ip, port + 1);
+        if far < 0 || mic < 0 {
+            say(b"voipcli: collectors are not listening (need both ports)\n");
+            return 6;
+        }
+        let sk = socket(AF_PACKET, SOCK_RAW, ETH_P_ALL);
+        if sk < 0 {
+            say(b"voipcli: cannot open a packet socket\n");
+            return 6;
+        }
+        say(b"voipcli: tapping - Ctrl-C to stop\n");
+        let mut f = [0u8; 2048];
+        let mut n_far: u32 = 0;
+        let mut n_mic: u32 = 0;
+        loop {
+            let n = recv(sk, f.as_mut_ptr() as *mut c_void, 2048, 0);
+            if n < 42 {
+                continue;
+            }
+            let n = n as usize;
+            // IPv4 straight after the MAC header, or one VLAN tag further in
+            let mut o = 14usize;
+            if f[12] == 0x81 && f[13] == 0x00 {
+                o = 18;
+            } else if !(f[12] == 0x08 && f[13] == 0x00) {
+                continue;
+            }
+            if o + 20 > n || f[o] >> 4 != 4 || f[o + 9] != 17 {
+                continue; // not IPv4 UDP
+            }
+            let ihl = ((f[o] & 0x0f) as usize) * 4;
+            let u = o + ihl;
+            if u + 8 + RTP_HDR >= n {
+                continue;
+            }
+            let sport = u16::from_be_bytes([f[u], f[u + 1]]);
+            let dport = u16::from_be_bytes([f[u + 2], f[u + 3]]);
+            let payload = u + 8 + RTP_HDR;
+            let len = n - payload;
+            // Whichever end owns the local RTP port tells us the direction.
+            if dport >= RTP_PORT_LO && dport <= RTP_PORT_HI {
+                write(far, f[payload..].as_ptr() as *const c_void, len);
+                n_far = n_far.wrapping_add(1);
+            } else if sport >= RTP_PORT_LO && sport <= RTP_PORT_HI {
+                write(mic, f[payload..].as_ptr() as *const c_void, len);
+                n_mic = n_mic.wrapping_add(1);
+            }
+        }
+    }
+}
+
 /// Legacy path: hand a command line to vgw's CLI over the CGI socket.
 fn send_cli(cmd: &[u8]) -> c_int {
     let mut msg = [0u8; 136];
@@ -1381,6 +1470,22 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         say(b"voipcli: line released
 ");
         return 0;
+    }
+
+    // --- passively tap a real call, both directions, straight to the PC ---
+    if a1 == b"tap" {
+        if argc < 3 {
+            say(b"usage: voipcli tap <collector-ip> [base-port, default 9998]
+");
+            return 1;
+        }
+        let ip = parse_ip(arg(argv, 2));
+        let port = if argc >= 4 {
+            atoi(arg(argv, 3)) as u16
+        } else {
+            9998
+        };
+        return tap_call(ip, port);
     }
 
     // --- record the handset microphone ---
