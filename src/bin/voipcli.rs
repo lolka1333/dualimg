@@ -58,6 +58,8 @@ unsafe extern "C" {
     fn accept(fd: c_int, addr: *mut c_void, len: *mut u32) -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
     fn creat(path: *const c_char, mode: u32) -> c_int;
+    fn fork() -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
     fn exit(code: c_int) -> !;
 }
 
@@ -899,7 +901,7 @@ fn stop_channel(ch: u32) -> c_int {
 /// pipe a stream at it from anywhere on the LAN (`… | nc 192.168.1.254 9999`). Lifting the
 /// handset starts playback, hanging up or ending the stream returns it to waiting — no
 /// permanently open ssh session in the middle.
-fn listen_mode(ch: u32, port: u16, number: &[u8]) -> c_int {
+fn listen_mode(ch: u32, port: u16, number: &[u8], collector: u32, cport: u16) -> c_int {
     unsafe {
         let srv = socket(AF_INET, SOCK_STREAM, 0);
         if srv < 0 {
@@ -981,8 +983,25 @@ fn listen_mode(ch: u32, port: u16, number: &[u8]) -> c_int {
                         say(b"voipcli: line parked in CONNECTED - no tones will start\n");
                     }
                     say(b"voipcli: off-hook - streaming\n");
+                    // Capture the handset the moment it comes up, without anyone having to
+                    // type a second command. It runs as a child so the audio we are
+                    // sending keeps its 20 ms pacing, and it is stopped with the call.
+                    let mut rec_pid = -1;
+                    if collector != 0 {
+                        rec_pid = fork();
+                        if rec_pid == 0 {
+                            tap_call(collector, cport);
+                            exit(0);
+                        }
+                        if rec_pid > 0 {
+                            say(b"voipcli: capturing the handset to the collector\n");
+                        }
+                    }
                     dup2(client, 0); // hand the socket to the player as stdin
                     play_on(&i, ch, b"-\0", 8);
+                    if rec_pid > 0 {
+                        kill(rec_pid, 15);
+                    }
                 }
                 None => {
                     stop_channel(ch);
@@ -1515,7 +1534,13 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
         let port = if argc >= 4 { atoi(arg(argv, 3)) as u16 } else { 9999 };
         let number = if argc >= 5 { arg(argv, 4) } else { b"" as &[u8] };
-        return listen_mode(ch, port, number);
+        let collector = if argc >= 6 { parse_ip(arg(argv, 5)) } else { 0 };
+        let cport = if argc >= 7 {
+            atoi(arg(argv, 6)) as u16
+        } else {
+            9998
+        };
+        return listen_mode(ch, port, number, collector, cport);
     }
 
     // --- wait for the handset, then play (file or "-" for a live stream on stdin) ---
