@@ -970,11 +970,18 @@ fn listen_mode(ch: u32, port: u16, number: &[u8], collector: u32, cport: u16) ->
             let tv: [u32; 2] = [0, 200_000];
             setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, tv.as_ptr() as *const c_void, 8);
             let mut scratch = [0u8; 2048];
+            // Every state read attaches to vgw_app with ptrace, which stops it. Polling
+            // five times a second meant repeatedly freezing the very process that has to
+            // notice the handset coming up, so check about once a second instead.
+            let mut tick = 0u32;
             let live = loop {
-                match chan_info(ch) {
-                    Some(i) if i.opened != 0 && i.cnx_id >= 0 => break Some(i),
-                    _ => {}
+                if tick % 5 == 0 {
+                    match chan_info(ch) {
+                        Some(i) if i.opened != 0 && i.cnx_id >= 0 => break Some(i),
+                        _ => {}
+                    }
                 }
+                tick = tick.wrapping_add(1);
                 // 0 is a closed stream; a negative result is just the timeout firing.
                 if read(client, scratch.as_mut_ptr() as *mut c_void, 2048) == 0 {
                     break None;
