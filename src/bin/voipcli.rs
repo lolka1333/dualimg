@@ -1173,6 +1173,18 @@ fn record_mic(ch: u32, path: &[u8], secs: u32) -> c_int {
             if want != 0 && got >= want {
                 break;
             }
+            // Parking the line keeps the connection up even after the handset goes down,
+            // so the DSP happily carries on producing silence. Watch the channel record
+            // and stop once the call is actually gone.
+            if got % 50 == 0 {
+                match chan_info(ch) {
+                    Some(i) if i.opened != 0 && i.cnx_id >= 0 => {}
+                    _ => {
+                        say(b"voipcli: the call ended\n");
+                        break;
+                    }
+                }
+            }
         }
         close(out);
         close(ep);
@@ -1345,6 +1357,30 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             }
             None => 4,
         };
+    }
+
+    // --- hand the parked line back to the firmware ---
+    if a1 == b"release" {
+        let ch = if argc >= 3 { atoi(arg(argv, 2)) } else { 0 };
+        let pid = vgw_pid();
+        if pid <= 0 {
+            return 4;
+        }
+        // Back to IDLE, then let the firmware close the channel through its own path.
+        poke_remote(
+            pid,
+            LSM_LINE_BASE + (ch as c_long) * LSM_LINE_STRIDE + LSM_STATE_OFF,
+            0,
+        );
+        stop_channel(ch);
+        let mut cmd = [0u8; 32];
+        let head = b"dsp close ";
+        cmd[..head.len()].copy_from_slice(head);
+        let n = put_num(&mut cmd, head.len(), ch);
+        send_cli(&cmd[..n]);
+        say(b"voipcli: line released
+");
+        return 0;
     }
 
     // --- record the handset microphone ---
