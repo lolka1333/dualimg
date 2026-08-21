@@ -57,6 +57,7 @@ unsafe extern "C" {
     fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn accept(fd: c_int, addr: *mut c_void, len: *mut u32) -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
+    fn creat(path: *const c_char, mode: u32) -> c_int;
     fn exit(code: c_int) -> !;
 }
 
@@ -96,6 +97,10 @@ const LSM_CONNECTED: u32 = 6; // 0 IDLE, 1 DIAL_TONE, 2 COLLECT, 6 CONNECTED, 10
 const CHAN_TABLE_BASE: c_long = 0x0058_896c;
 const CHAN_STRIDE: c_long = 0xb80;
 const IOCTL_ENDPT_PACKET: c_long = 0xc01c_d10bu32 as i32 as c_long;
+// The driver's receive side, taken from vgw_app's "Endpoint Packet task": a blocking
+// ioctl that returns the next packet coming OUT of the DSP, i.e. what the handset
+// microphone picked up. Same EPPACKET shape as the send path.
+const IOCTL_ENDPT_GET_PACKET: c_long = 0xc01c_d10cu32 as i32 as c_long;
 const RTP_PAYLOAD: usize = 160; // 20 ms of 8 kHz G.711
 const RTP_HDR: usize = 12;
 const IOCTL_ENDPT_SIGNAL: c_long = 0xc024_d105u32 as i32 as c_long;
@@ -1088,6 +1093,72 @@ fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
     play_on(&live, ch, path, 8)
 }
 
+/// Record what the handset microphone is picking up.
+///
+/// vgw_app runs the same blocking ioctl in its packet task, so each packet goes to
+/// whichever reader asks first — during one of our own injected calls that costs nothing,
+/// because vgw has nowhere to forward the audio anyway. In a genuine call it would steal
+/// half the outgoing speech, so this is meant for the calls we set up ourselves.
+fn record_mic(ch: u32, path: &[u8], secs: u32) -> c_int {
+    unsafe {
+        let ep = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
+        if ep < 0 {
+            say(b"voipcli: cannot open /dev/bcmendpoint0\n");
+            return 6;
+        }
+        let out = creat(path.as_ptr() as *const c_char, 0o644);
+        if out < 0 {
+            say(b"voipcli: cannot create the output file\n");
+            close(ep);
+            return 6;
+        }
+        let mut buf = [0u8; 1024];
+        // EPPACKET { mediaType, data } — the driver fills both
+        let mut eppacket: [u32; 2] = [0, buf.as_mut_ptr() as u32];
+        let want = if secs == 0 { 0 } else { secs * 50 }; // 50 packets per second
+        let mut got: u32 = 0;
+        let mut kept: u32 = 0;
+        say(b"voipcli: recording - Ctrl-C to stop\n");
+        loop {
+            let mut parm: [u32; 7] = [0x1c, 0, 0, eppacket.as_mut_ptr() as u32, 0, 0, 0];
+            eppacket[0] = 0;
+            let rc = ioctl(ep, IOCTL_ENDPT_GET_PACKET, parm.as_mut_ptr() as *mut c_void);
+            if rc == 1 {
+                break; // driver shutting down
+            }
+            if rc != 0 {
+                continue;
+            }
+            let len = parm[4] as usize;
+            // Only audio, and only from the channel asked for; skip the RTP header so the
+            // file is raw G.711 that wav_to_alaw's counterpart can read straight back.
+            if len > RTP_HDR && len <= buf.len() && parm[1] == ch {
+                write(
+                    out,
+                    buf[RTP_HDR..].as_ptr() as *const c_void,
+                    len - RTP_HDR,
+                );
+                kept = kept.wrapping_add(1);
+            }
+            got = got.wrapping_add(1);
+            if want != 0 && got >= want {
+                break;
+            }
+        }
+        close(out);
+        close(ep);
+        let mut m = [0u8; 64];
+        let h = b"voipcli: saved ";
+        m[..h.len()].copy_from_slice(h);
+        let mut k = put_num(&mut m, h.len(), kept);
+        let t = b" packets\n";
+        m[k..k + t.len()].copy_from_slice(t);
+        k += t.len();
+        say(&m[..k]);
+        0
+    }
+}
+
 /// Legacy path: hand a command line to vgw's CLI over the CGI socket.
 fn send_cli(cmd: &[u8]) -> c_int {
     let mut msg = [0u8; 136];
@@ -1245,6 +1316,22 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             }
             None => 4,
         };
+    }
+
+    // --- record the handset microphone ---
+    if a1 == b"rec" {
+        if argc < 4 {
+            say(b"usage: voipcli rec <ch> <file.alaw> [seconds, 0 = until stopped]
+");
+            return 1;
+        }
+        let ch = atoi(arg(argv, 2));
+        let raw = arg(argv, 3);
+        let mut path = [0u8; 128];
+        let n = if raw.len() > 126 { 126 } else { raw.len() };
+        path[..n].copy_from_slice(&raw[..n]);
+        let secs = if argc >= 5 { atoi(arg(argv, 4)) } else { 0 };
+        return record_mic(ch, &path, secs);
     }
 
     // --- panic button: silence ring and tones on a channel ---
