@@ -922,6 +922,26 @@ fn listen_mode(ch: u32, port: u16, number: &[u8], collector: u32, cport: u16) ->
             return 2;
         }
         listen(srv, 1);
+        // A session that ended without release leaves the line parked in CONNECTED, and
+        // lifting the handset then opens no channel at all: the line manager believes a
+        // call is already up, so there is no off-hook to detect and nothing happens.
+        if lsm_state(ch) == Some(LSM_CONNECTED) {
+            let stale = match chan_info(ch) {
+                Some(i) => i.opened == 0 || i.cnx_id < 0,
+                None => true,
+            };
+            if stale {
+                say(b"voipcli: line was left parked - resetting it\n");
+                let pid = vgw_pid();
+                if pid > 0 {
+                    poke_remote(
+                        pid,
+                        LSM_LINE_BASE + (ch as c_long) * LSM_LINE_STRIDE + LSM_STATE_OFF,
+                        0,
+                    );
+                }
+            }
+        }
         say(b"voipcli: listening - pipe audio at this port, then lift the handset\n");
 
         loop {
