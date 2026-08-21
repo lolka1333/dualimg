@@ -1233,12 +1233,9 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32) -> c_int {
             let len = parm[4] as usize;
             // Only audio, and only from the channel asked for; skip the RTP header so the
             // file is raw G.711 that wav_to_alaw's counterpart can read straight back.
-            if len > RTP_HDR && len <= buf.len() && parm[1] == ch {
-                write(
-                    out,
-                    buf[RTP_HDR..].as_ptr() as *const c_void,
-                    len - RTP_HDR,
-                );
+            let hdr = RTP_HDR + ((buf[0] & 0x0f) as usize) * 4;
+            if len > hdr && len <= buf.len() && parm[1] == ch {
+                write(out, buf[hdr..].as_ptr() as *const c_void, len - hdr);
                 kept = kept.wrapping_add(1);
             }
             got = got.wrapping_add(1);
@@ -1345,7 +1342,14 @@ fn tap_call(ip: u32, port: u16, mic_only: bool) -> c_int {
             }
             let sport = u16::from_be_bytes([f[u], f[u + 1]]);
             let dport = u16::from_be_bytes([f[u + 2], f[u + 3]]);
-            let payload = u + 8 + RTP_HDR;
+            // RTP header is 12 bytes plus four per CSRC, so take it from the packet
+            // rather than assuming the minimum.
+            let rtp = u + 8;
+            let hdr = RTP_HDR + ((f[rtp] & 0x0f) as usize) * 4;
+            let payload = rtp + hdr;
+            if payload >= n {
+                continue;
+            }
             let len = n - payload;
             // Whichever end owns the local RTP port tells us the direction.
             if far >= 0 && dport >= RTP_PORT_LO && dport <= RTP_PORT_HI {
