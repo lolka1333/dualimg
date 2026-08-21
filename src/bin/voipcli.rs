@@ -730,6 +730,18 @@ fn play_on(info: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
             seq = seq.wrapping_add(1);
             ts = ts.wrapping_add(RTP_PAYLOAD as u32);
             sent = sent.wrapping_add(1);
+
+            // To the line manager this is a handset left off-hook without dialling, so it
+            // walks its own script over our audio: dial tone, then reorder, then the
+            // off-hook howler. Silencing the tone generator twice a second keeps each of
+            // those from ever getting going.
+            if sent % 25 == 0 {
+                let mut q = [0u8; 32];
+                let qh = b"dsp tone_off ";
+                q[..qh.len()].copy_from_slice(qh);
+                let qn = put_num(&mut q, qh.len(), ch);
+                send_cli(&q[..qn]);
+            }
             usleep(20000); // one packet per 20 ms, or the audio runs fast
         }
         close(ep);
