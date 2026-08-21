@@ -990,7 +990,7 @@ fn listen_mode(ch: u32, port: u16, number: &[u8], collector: u32, cport: u16) ->
                     if collector != 0 {
                         rec_pid = fork();
                         if rec_pid == 0 {
-                            tap_call(collector, cport);
+                            tap_call(collector, cport, true);
                             exit(0);
                         }
                         if rec_pid > 0 {
@@ -1254,12 +1254,18 @@ fn dial_collector(ip: u32, port: u16) -> c_int {
 /// call would eat half of what the other side hears. A packet socket only ever gets a
 /// copy, so the call is untouched. Both directions are separated by which side owns the
 /// RTP port and sent to two collectors: far end on `port`, handset on `port + 1`.
-fn tap_call(ip: u32, port: u16) -> c_int {
+fn tap_call(ip: u32, port: u16, mic_only: bool) -> c_int {
     unsafe {
-        let far = dial_collector(ip, port);
-        let mic = dial_collector(ip, port + 1);
-        if far < 0 || mic < 0 {
-            say(b"voipcli: collectors are not listening (need both ports)\n");
+        // Auto-capture during one of our own calls only wants the handset: the far side
+        // is the stream the PC is already sending. Take whichever collectors are up
+        // rather than insisting on both, since a missing one used to kill the capture.
+        let (far, mic) = if mic_only {
+            (-1, dial_collector(ip, port))
+        } else {
+            (dial_collector(ip, port), dial_collector(ip, port + 1))
+        };
+        if far < 0 && mic < 0 {
+            say(b"voipcli: no collector is listening\n");
             return 6;
         }
         let sk = socket(AF_PACKET, SOCK_RAW, ETH_P_ALL);
@@ -1297,10 +1303,10 @@ fn tap_call(ip: u32, port: u16) -> c_int {
             let payload = u + 8 + RTP_HDR;
             let len = n - payload;
             // Whichever end owns the local RTP port tells us the direction.
-            if dport >= RTP_PORT_LO && dport <= RTP_PORT_HI {
+            if far >= 0 && dport >= RTP_PORT_LO && dport <= RTP_PORT_HI {
                 write(far, f[payload..].as_ptr() as *const c_void, len);
                 n_far = n_far.wrapping_add(1);
-            } else if sport >= RTP_PORT_LO && sport <= RTP_PORT_HI {
+            } else if mic >= 0 && sport >= RTP_PORT_LO && sport <= RTP_PORT_HI {
                 write(mic, f[payload..].as_ptr() as *const c_void, len);
                 n_mic = n_mic.wrapping_add(1);
             }
@@ -1504,7 +1510,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         } else {
             9998
         };
-        return tap_call(ip, port);
+        return tap_call(ip, port, false);
     }
 
     // --- record the handset microphone ---
@@ -1538,7 +1544,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         let cport = if argc >= 7 {
             atoi(arg(argv, 6)) as u16
         } else {
-            9998
+            9997
         };
         return listen_mode(ch, port, number, collector, cport);
     }
