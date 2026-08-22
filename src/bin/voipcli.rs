@@ -1130,6 +1130,81 @@ fn set_far_side(stream_idx: u32, ip: &[u8], port: u16) -> bool {
     poke_remote(pid, base + DCSTM_RPORT_OFF, word)
 }
 
+/// Ring the phone and, on pick-up, point the call at a collector so the firmware streams
+/// the handset there itself. Nothing is taken from the driver's queue, so the recording is
+/// whole rather than the every-other-packet mess that competing readers produce.
+fn ring_and_stream(ch: u32, number: &[u8], ip: &[u8], port: u16) -> c_int {
+    let info = match chan_info(ch) {
+        Some(i) => i,
+        None => return 4,
+    };
+    endpt_signal(&info.state, EPSIG_RINGING, 1);
+    let mut cid = [0u8; 0x52];
+    build_cid(number, b"", &mut cid);
+    if !endpt_signal(&info.state, EPSIG_CALLERID, cid.as_ptr() as u32) {
+        return 5;
+    }
+    arm_interrupt(ch);
+    say(b"voipcli: ringing - pick up, then talk\n");
+
+    let mut tries = 0;
+    let live = loop {
+        unsafe { usleep(500_000) };
+        tries += 1;
+        if let Some(i) = chan_info(ch) {
+            if i.opened != 0 && i.cnx_id >= 0 {
+                break Some(i);
+            }
+        }
+        if tries > 80 {
+            break None;
+        }
+    };
+    let live = match live {
+        Some(i) => i,
+        None => {
+            stop_channel(ch);
+            say(b"voipcli: nobody picked up\n");
+            return 6;
+        }
+    };
+    RINGING_CH.store(u32::MAX, Ordering::Relaxed);
+    endpt_signal(&live.state, EPSIG_RINGING, 0);
+    endpt_signal(&live.state, EPSIG_RINGING_INT, 0);
+
+    let mut cmd = [0u8; 32];
+    let head = b"dsp tone_off ";
+    cmd[..head.len()].copy_from_slice(head);
+    let n = put_num(&mut cmd, head.len(), ch);
+    send_cli(&cmd[..n]);
+
+    if !set_far_side(ch, ip, port) {
+        say(b"voipcli: could not set the far side\n");
+        return 7;
+    }
+    let mut act = [0u8; 32];
+    let ah = b"dsp activateRTP ";
+    act[..ah.len()].copy_from_slice(ah);
+    let an = put_num(&mut act, ah.len(), ch);
+    send_cli(&act[..an]);
+    unsafe { usleep(400_000) };
+    lsm_set_connected(ch);
+    say(b"voipcli: picked up - the handset is streaming to the collector\n");
+    say(b"voipcli: talk now; Ctrl-C when finished\n");
+
+    // Nothing left to do here: the firmware is doing the sending. Just hold the call.
+    loop {
+        unsafe { usleep(1_000_000) };
+        match chan_info(ch) {
+            Some(i) if i.opened != 0 && i.cnx_id >= 0 => {}
+            _ => {
+                say(b"voipcli: the call ended\n");
+                return 0;
+            }
+        }
+    }
+}
+
 /// Ring the phone and, once it is picked up, record only the handset.
 ///
 /// Nothing is played back, which keeps the capture away from the audio-injection path that
@@ -1669,6 +1744,22 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             9998
         };
         return tap_call(ip, port, false);
+    }
+
+    // --- one-shot: ring, pick up, and let the firmware stream the handset out ---
+    if a1 == b"call" {
+        if argc < 5 {
+            say(b"usage: voipcli call <ch> <caller-number> <collector-ip> [port, default 9996]
+");
+            return 1;
+        }
+        let ch = atoi(arg(argv, 2));
+        let port = if argc >= 6 {
+            atoi(arg(argv, 5)) as u16
+        } else {
+            9996
+        };
+        return ring_and_stream(ch, arg(argv, 3), arg(argv, 4), port);
     }
 
     // --- point the far side of the call at a collector ---
