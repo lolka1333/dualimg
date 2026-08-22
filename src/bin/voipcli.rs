@@ -1233,8 +1233,16 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32) -> c_int {
             let len = parm[4] as usize;
             // Only audio, and only from the channel asked for; skip the RTP header so the
             // file is raw G.711 that wav_to_alaw's counterpart can read straight back.
+            // The queue carries more than voice: RTCP reports and fax frames come through
+            // the same ioctl, and writing those into the stream is what made the recording
+            // crackle and break up. Keep media type 0 (RTP), version 2, and a G.711
+            // payload type - everything else is not audio.
+            let media_ok = eppacket[0] == 0;
+            let rtp_ok = len > RTP_HDR && (buf[0] & 0xc0) == 0x80;
+            let pt = buf[1] & 0x7f;
+            let voice = pt == 8 || pt == 0;
             let hdr = RTP_HDR + ((buf[0] & 0x0f) as usize) * 4;
-            if len > hdr && len <= buf.len() && parm[1] == ch {
+            if media_ok && rtp_ok && voice && len > hdr && len <= buf.len() {
                 write(out, buf[hdr..].as_ptr() as *const c_void, len - hdr);
                 kept = kept.wrapping_add(1);
             }
