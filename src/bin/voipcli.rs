@@ -1087,6 +1087,64 @@ fn wait_offhook(ch: u32, path: &[u8]) -> c_int {
     }
 }
 
+/// Ring the phone and, once it is picked up, record only the handset.
+///
+/// Nothing is played back, which keeps the capture away from the audio-injection path that
+/// the two of them fight over — this is how to see what the microphone alone produces.
+fn ring_and_record(ch: u32, number: &[u8], dest: &[u8]) -> c_int {
+    let info = match chan_info(ch) {
+        Some(i) => i,
+        None => return 4,
+    };
+    endpt_signal(&info.state, EPSIG_RINGING, 1);
+    let mut cid = [0u8; 0x52];
+    build_cid(number, b"", &mut cid);
+    if !endpt_signal(&info.state, EPSIG_CALLERID, cid.as_ptr() as u32) {
+        return 5;
+    }
+    arm_interrupt(ch);
+    say(b"voipcli: ringing - pick up, then talk\n");
+
+    let mut tries = 0;
+    let live = loop {
+        unsafe { usleep(500_000) };
+        tries += 1;
+        if let Some(i) = chan_info(ch) {
+            if i.opened != 0 && i.cnx_id >= 0 {
+                break Some(i);
+            }
+        }
+        if tries > 80 {
+            break None;
+        }
+    };
+    let live = match live {
+        Some(i) => i,
+        None => {
+            stop_channel(ch);
+            say(b"voipcli: nobody picked up\n");
+            return 6;
+        }
+    };
+    RINGING_CH.store(u32::MAX, Ordering::Relaxed);
+    endpt_signal(&live.state, EPSIG_RINGING, 0);
+    endpt_signal(&live.state, EPSIG_RINGING_INT, 0);
+    let mut cmd = [0u8; 32];
+    let head = b"dsp tone_off ";
+    cmd[..head.len()].copy_from_slice(head);
+    let n = put_num(&mut cmd, head.len(), ch);
+    send_cli(&cmd[..n]);
+    let mut act = [0u8; 32];
+    let ah = b"dsp activateRTP ";
+    act[..ah.len()].copy_from_slice(ah);
+    let an = put_num(&mut act, ah.len(), ch);
+    send_cli(&act[..an]);
+    unsafe { usleep(400_000) };
+    lsm_set_connected(ch);
+    say(b"voipcli: picked up - recording the handset\n");
+    record_mic(ch, dest, 0)
+}
+
 /// Ring the phone, wait for it to be picked up, then speak the file into it.
 ///
 /// Off-hook is detected by watching vgw_app's own channel record: when the handset comes
@@ -1568,6 +1626,21 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             9998
         };
         return tap_call(ip, port, false);
+    }
+
+    // --- ring, then record the handset only (no playback, so nothing competes) ---
+    if a1 == b"ringrec" {
+        if argc < 5 {
+            say(b"usage: voipcli ringrec <ch> <caller-number> <file|tcp:ip:port>
+");
+            return 1;
+        }
+        let ch = atoi(arg(argv, 2));
+        let raw = arg(argv, 4);
+        let mut path = [0u8; 128];
+        let n = if raw.len() > 126 { 126 } else { raw.len() };
+        path[..n].copy_from_slice(&raw[..n]);
+        return ring_and_record(ch, arg(argv, 3), &path);
     }
 
     // --- record the handset microphone ---
