@@ -96,6 +96,13 @@ const LSM_STATE_OFF: c_long = 0x0c;
 const LSM_TIMER0_ACTIVE: c_long = 0x40;
 const LSM_TIMER1_ACTIVE: c_long = 0x50;
 const LSM_CONNECTED: u32 = 6; // 0 IDLE, 1 DIAL_TONE, 2 COLLECT, 6 CONNECTED, 10 OFFHOOK_ALERT
+// datactrl's per-stream record (base from GOT slot 0x53ab7c, 0x2c8 apart). "dcstm set
+// info" writes the far side straight in here: the address is a plain string and the port
+// a u16 next to it.
+const DCSTREAM_BASE: c_long = 0x005f_2e90;
+const DCSTREAM_STRIDE: c_long = 0x2c8;
+const DCSTM_RADDR_OFF: c_long = 0x120; // remote address, string
+const DCSTM_RPORT_OFF: c_long = 0x220; // remote audio port, u16
 const CHAN_TABLE_BASE: c_long = 0x0058_896c;
 const CHAN_STRIDE: c_long = 0xb80;
 const IOCTL_ENDPT_PACKET: c_long = 0xc01c_d10bu32 as i32 as c_long;
@@ -1087,6 +1094,42 @@ fn wait_offhook(ch: u32, path: &[u8]) -> c_int {
     }
 }
 
+/// Point the call's far side at a collector, so the firmware itself sends the microphone
+/// there as ordinary RTP.
+///
+/// This is the way out of fighting for the driver's receive queue: while both we and
+/// vgw_app read from it, each packet lands with whichever asks first and roughly half the
+/// speech never reaches the recording. A synthetic call has no far end to send to, so
+/// giving it one costs nothing and turns the handset audio into a normal outgoing stream.
+fn set_far_side(stream_idx: u32, ip: &[u8], port: u16) -> bool {
+    let pid = vgw_pid();
+    if pid <= 0 {
+        return false;
+    }
+    let base = DCSTREAM_BASE + (stream_idx as c_long) * DCSTREAM_STRIDE;
+
+    // Address is a NUL-terminated string; write it a word at a time.
+    let mut buf = [0u8; 20];
+    let n = if ip.len() > 15 { 15 } else { ip.len() };
+    buf[..n].copy_from_slice(&ip[..n]);
+    let mut w = 0usize;
+    while w < 20 {
+        let word = u32::from_be_bytes([buf[w], buf[w + 1], buf[w + 2], buf[w + 3]]);
+        if !poke_remote(pid, base + DCSTM_RADDR_OFF + w as c_long, word) {
+            return false;
+        }
+        w += 4;
+    }
+
+    // The port is a u16; keep the neighbouring halfword as it was.
+    let mut cur = [0u8; 4];
+    if !read_remote(pid, base + DCSTM_RPORT_OFF, &mut cur) {
+        return false;
+    }
+    let word = u32::from_be_bytes([(port >> 8) as u8, port as u8, cur[2], cur[3]]);
+    poke_remote(pid, base + DCSTM_RPORT_OFF, word)
+}
+
 /// Ring the phone and, once it is picked up, record only the handset.
 ///
 /// Nothing is played back, which keeps the capture away from the audio-injection path that
@@ -1626,6 +1669,25 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             9998
         };
         return tap_call(ip, port, false);
+    }
+
+    // --- point the far side of the call at a collector ---
+    if a1 == b"farside" {
+        if argc < 5 {
+            say(b"usage: voipcli farside <stream-idx> <ip> <port>
+");
+            return 1;
+        }
+        let idx = atoi(arg(argv, 2));
+        let port = atoi(arg(argv, 4)) as u16;
+        if !set_far_side(idx, arg(argv, 3), port) {
+            say(b"voipcli: could not write the far side
+");
+            return 7;
+        }
+        say(b"voipcli: far side set - now run 'vgw dsp activateRTP <ch>' to apply
+");
+        return 0;
     }
 
     // --- ring, then record the handset only (no playback, so nothing competes) ---
