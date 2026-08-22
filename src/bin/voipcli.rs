@@ -1392,7 +1392,7 @@ fn open_dest(path: &[u8]) -> c_int {
 ///
 /// `framed` writes the sequence-numbered form above; without it the payload goes out bare,
 /// which is what a plain file wants and what the older tooling still reads.
-fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool) -> c_int {
+fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool, watch: bool) -> c_int {
     unsafe {
         if framed && !write_all(out, MIC_MAGIC.as_ptr(), 4) {
             return 6;
@@ -1403,6 +1403,7 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool) -> c_i
         let want = if secs == 0 { 0 } else { secs * 50 }; // 50 packets per second
         let mut got: u32 = 0;
         let mut kept: u32 = 0;
+        let mut fails: u32 = 0;
         loop {
             let mut parm: [u32; 7] = [0x1c, 0, 0, eppacket.as_mut_ptr() as u32, 0, 0, 0];
             eppacket[0] = 0;
@@ -1445,10 +1446,23 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool) -> c_i
             // Parking the line keeps the connection up even after the handset goes down,
             // so the DSP happily carries on producing silence. Watch the channel record
             // and stop once the call is actually gone.
-            if got % 50 == 0 {
+            // Only one reader watches vgw. PTRACE_ATTACH admits a single tracer at a
+            // time, so a pool of them would collide, and the loser would read its own
+            // failure as the call having ended; it also stops vgw_app for the duration of
+            // every read, which is not something to do three times over.
+            if watch && got % 50 == 0 {
                 match chan_info(ch) {
-                    Some(i) if i.opened != 0 && i.cnx_id >= 0 => {}
-                    _ => break,
+                    Some(i) if i.opened != 0 && i.cnx_id >= 0 => fails = 0,
+                    Some(_) => break, // a straight answer: the call is gone
+                    None => {
+                        // A read that failed is not an answer at all.
+                        fails += 1;
+                        if fails >= 3 {
+                            say(b"voipcli: lost sight of vgw_app - stopping
+");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1466,7 +1480,7 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool) -> c_i
 
 /// One reader: its own endpoint handle, its own connection, its own share of the queue.
 /// A non-zero `ip` means a collector, otherwise `path` is used.
-fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32) -> c_int {
+fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, watch: bool) -> c_int {
     unsafe {
         let ep = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
         if ep < 0 {
@@ -1484,7 +1498,7 @@ fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32) -> c_int {
             close(ep);
             return 6;
         }
-        let r = record_mic_to(ch, ep, out, secs, framed);
+        let r = record_mic_to(ch, ep, out, secs, framed, watch);
         close(out);
         close(ep);
         r
@@ -1508,18 +1522,36 @@ fn spawn_readers(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, readers: u
     if !framed {
         n = 1;
     }
+    let mut kids = [0 as c_int; 6];
+    let mut nkids = 0usize;
     unsafe {
         let mut i = 1;
         while i < n {
-            if fork() == 0 {
-                one_reader(ch, path, ip, port, secs);
+            let pid = fork();
+            if pid == 0 {
+                one_reader(ch, path, ip, port, secs, false);
                 exit(0);
+            }
+            if pid > 0 {
+                kids[nkids] = pid;
+                nkids += 1;
             }
             usleep(20_000);
             i += 1;
         }
     }
-    one_reader(ch, path, ip, port, secs)
+    // This one watches, so it is also the one that knows when to end it. The others sit in
+    // a blocking ioctl and would not notice on their own; SIGKILL rather than SIGTERM
+    // because they inherited the ring handler and it does not exit.
+    let r = one_reader(ch, path, ip, port, secs, true);
+    unsafe {
+        let mut i = 0;
+        while i < nkids {
+            kill(kids[i], 9);
+            i += 1;
+        }
+    }
+    r
 }
 
 /// `rec` and `ringrec`: a path, which may be tcp:<ip>:<port>.
