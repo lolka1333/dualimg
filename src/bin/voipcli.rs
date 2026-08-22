@@ -1177,7 +1177,7 @@ fn ring_and_stream(ch: u32, number: &[u8], ip: &[u8], port: u16) -> c_int {
                 break Some(i);
             }
         }
-        if tries > 80 {
+        if tries > 180 {
             break None;
         }
     };
@@ -1253,7 +1253,7 @@ fn ring_and_record(ch: u32, number: &[u8], dest: &[u8]) -> c_int {
                 break Some(i);
             }
         }
-        if tries > 80 {
+        if tries > 180 {
             break None;
         }
     };
@@ -1578,7 +1578,16 @@ fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, watch: u32) -
             close(ep);
             return 6;
         }
+        // Stop vgw only now that there is somewhere to put the audio. Reaching a collector
+        // that is not listening takes as long as it takes, and the line should not be
+        // frozen for the wait.
+        let watch = if watch == WATCH_FROZEN && !freeze_vgw(true) {
+            WATCH_ATTACH
+        } else {
+            watch
+        };
         let r = record_mic_to(ch, ep, out, secs, framed, watch);
+        thaw_vgw(true);
         close(out);
         close(ep);
         r
@@ -1596,14 +1605,7 @@ fn spawn_readers(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, readers: u
     // of them racing it.
     if readers == 0 {
         let cap = if secs == 0 { FREEZE_CAP_SECS } else { secs };
-        let watch = if freeze_vgw(true) {
-            WATCH_FROZEN
-        } else {
-            WATCH_ATTACH
-        };
-        let r = one_reader(ch, path, ip, port, cap, watch);
-        thaw_vgw(true);
-        return r;
+        return one_reader(ch, path, ip, port, cap, WATCH_FROZEN);
     }
     let mut n = if readers > 6 { 6 } else { readers };
     if !framed {
