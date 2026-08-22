@@ -115,6 +115,18 @@ const RTP_HDR: usize = 12;
 /// How many processes race vgw_app for the driver's packet queue. Three is where the
 /// return flattens out: our share goes 1/2 -> 2/3 -> 3/4 and each one costs a process.
 const MIC_READERS: u32 = 3;
+/// Longest a capture will hold vgw_app stopped when no duration was given. It resumes by
+/// itself if voipcli dies, but a forgotten terminal should not freeze the line all day.
+const FREEZE_CAP_SECS: u32 = 180;
+
+/// A reader in the pool: the one that watches will kill it when the call is over.
+const WATCH_NONE: u32 = 0;
+/// The lone watcher: attaches to vgw_app for each read of the channel record.
+const WATCH_ATTACH: u32 = 1;
+/// The watcher while vgw_app is held stopped.
+const WATCH_FROZEN: u32 = 2;
+/// vgw_app's pid while we hold it, so the capture loop and the caller agree on it.
+static FROZEN_PID: AtomicU32 = AtomicU32::new(0);
 const IOCTL_ENDPT_SIGNAL: c_long = 0xc024_d105u32 as i32 as c_long;
 const EPSIG_RINGING: u32 = 0x0F;
 const EPSIG_RINGING_INT: u32 = 0x10; // internal-call variant used by ring_callerid_off
@@ -273,7 +285,6 @@ fn read_remote(pid: c_int, addr: c_long, out: &mut [u8]) -> bool {
         }
         let mut st: c_int = 0;
         waitpid(pid, &mut st as *mut c_int, 0);
-        let mut ok = true;
         let mut w = 0usize;
         let want = out.len();
         while w < want {
@@ -287,10 +298,7 @@ fn read_remote(pid: c_int, addr: c_long, out: &mut [u8]) -> bool {
             w += 4;
         }
         ptrace(PTRACE_DETACH, pid, 0, 0);
-        if !ok {
-            say(b"voipcli: cannot read endpoint state from vgw_app\n");
-        }
-        ok
+        true
     }
 }
 
@@ -756,6 +764,7 @@ fn play_on(info_in: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
         let mut dropped: u32 = 0;
         let mut refused: u32 = 0;
         let mut refused_run: u32 = 0;
+        let mut unreadable: u32 = 0;
         loop {
             // A pipe returns whatever has arrived so far, so keep asking until the frame
             // is whole; a short final read is padded, EOF ends the stream.
@@ -818,12 +827,27 @@ fn play_on(info_in: &ChanInfo, ch: u32, path: &[u8], pt: u32) -> c_int {
                             Some(fresh) if fresh.opened != 0 && fresh.cnx_id >= 0 => {
                                 info = fresh;
                                 refused_run = 0;
+                                unreadable = 0;
                             }
-                            _ => {
+                            Some(_) => {
                                 say(b"voipcli: the call is gone, stopping\n");
                                 close(ep);
                                 close(fd);
                                 return 7;
+                            }
+                            None => {
+                                // Could not read vgw at all - which the capture child
+                                // causes by design, since it holds vgw stopped and there is
+                                // only ever one tracer. Say nothing about the call from
+                                // that; give up only if it keeps happening.
+                                unreadable += 1;
+                                if unreadable >= 8 {
+                                    say(b"voipcli: lost sight of vgw_app, stopping\n");
+                                    close(ep);
+                                    close(fd);
+                                    return 7;
+                                }
+                                refused_run = 0;
                             }
                         }
                     }
@@ -1032,7 +1056,7 @@ fn listen_mode(ch: u32, port: u16, number: &[u8], collector: u32, cport: u16) ->
                             // first few packets. The receive ioctl keeps producing audio for
                             // as long as the handset is up, and stealing from vgw costs
                             // nothing here because it has nowhere to forward it anyway.
-                            record_mic_tcp(ch, collector, cport, 0, MIC_READERS);
+                            record_mic_tcp(ch, collector, cport, 0, 0);
                             exit(0);
                         }
                         if rec_pid > 0 {
@@ -1257,7 +1281,7 @@ fn ring_and_record(ch: u32, number: &[u8], dest: &[u8]) -> c_int {
     unsafe { usleep(400_000) };
     lsm_set_connected(ch);
     say(b"voipcli: picked up - recording the handset\n");
-    record_mic(ch, dest, 0, MIC_READERS)
+    record_mic(ch, dest, 0, 0)
 }
 
 /// Ring the phone, wait for it to be picked up, then speak the file into it.
@@ -1392,7 +1416,7 @@ fn open_dest(path: &[u8]) -> c_int {
 ///
 /// `framed` writes the sequence-numbered form above; without it the payload goes out bare,
 /// which is what a plain file wants and what the older tooling still reads.
-fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool, watch: bool) -> c_int {
+fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool, watch: u32) -> c_int {
     unsafe {
         if framed && !write_all(out, MIC_MAGIC.as_ptr(), 4) {
             return 6;
@@ -1450,8 +1474,21 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool, watch:
             // time, so a pool of them would collide, and the loser would read its own
             // failure as the call having ended; it also stops vgw_app for the duration of
             // every read, which is not something to do three times over.
-            if watch && got % 50 == 0 {
-                match chan_info(ch) {
+            if watch != WATCH_NONE && got % 250 == 0 {
+                // Held in a ptrace stop, vgw_app cannot process the handset going down, so
+                // the record it keeps would never change and the capture would run to its
+                // cap every time. Letting it go for a moment first is what makes the
+                // recording end when the call does; it costs a packet or two out of every
+                // 250, which the collector covers over.
+                if watch == WATCH_FROZEN {
+                    thaw_vgw(false);
+                    usleep(40_000);
+                }
+                let seen = chan_info(ch);
+                if watch == WATCH_FROZEN {
+                    freeze_vgw(false);
+                }
+                match seen {
                     Some(i) if i.opened != 0 && i.cnx_id >= 0 => fails = 0,
                     Some(_) => break, // a straight answer: the call is gone
                     None => {
@@ -1478,9 +1515,52 @@ fn record_mic_to(ch: u32, ep: c_int, out: c_int, secs: u32, framed: bool, watch:
     }
 }
 
+/// Hold vgw_app in a ptrace stop for the length of a capture.
+///
+/// Sharing is the whole problem: the driver gives each packet to exactly one reader, and
+/// vgw_app's packet task is the reader we lose them to. Stopping it removes the competition
+/// outright, so a single reader of ours then gets every packet instead of three quarters of
+/// them. Only do this on a call we invented - there is no far end for vgw to be starving -
+/// and never during a genuine conversation, where it would cut the audio the other person
+/// hears. If voipcli dies the kernel detaches on its behalf and vgw resumes, so a crash
+/// cannot leave the line frozen.
+fn freeze_vgw(loud: bool) -> bool {
+    let pid = vgw_pid();
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        if ptrace(PTRACE_ATTACH, pid, 0, 0) < 0 {
+            if loud {
+                say(b"voipcli: could not stop vgw_app - sharing the queue instead\n");
+            }
+            return false;
+        }
+        let mut st: c_int = 0;
+        waitpid(pid, &mut st as *mut c_int, 0);
+    }
+    FROZEN_PID.store(pid as u32, Ordering::Relaxed);
+    if loud {
+        say(b"voipcli: vgw_app held - this reader now gets every packet\n");
+    }
+    true
+}
+
+fn thaw_vgw(loud: bool) {
+    let pid = FROZEN_PID.swap(0, Ordering::Relaxed) as c_int;
+    if pid > 0 {
+        unsafe {
+            ptrace(PTRACE_DETACH, pid, 0, 0);
+        }
+        if loud {
+            say(b"voipcli: vgw_app released\n");
+        }
+    }
+}
+
 /// One reader: its own endpoint handle, its own connection, its own share of the queue.
 /// A non-zero `ip` means a collector, otherwise `path` is used.
-fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, watch: bool) -> c_int {
+fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, watch: u32) -> c_int {
     unsafe {
         let ep = open(DEV_ENDPOINT.as_ptr() as *const c_char, O_RDWR);
         if ep < 0 {
@@ -1512,13 +1592,20 @@ fn one_reader(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, watch: bool) 
 /// which is fine, because the streaming case is the one that was dropping packets.
 fn spawn_readers(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, readers: u32) -> c_int {
     let framed = ip != 0 || (path.len() > 4 && &path[..4] == b"tcp:");
-    let mut n = if readers < 1 {
-        1
-    } else if readers > 6 {
-        6
-    } else {
-        readers
-    };
+    // No readers asked for means solo: stop vgw and take the lot, which beats any number
+    // of them racing it.
+    if readers == 0 {
+        let cap = if secs == 0 { FREEZE_CAP_SECS } else { secs };
+        let watch = if freeze_vgw(true) {
+            WATCH_FROZEN
+        } else {
+            WATCH_ATTACH
+        };
+        let r = one_reader(ch, path, ip, port, cap, watch);
+        thaw_vgw(true);
+        return r;
+    }
+    let mut n = if readers > 6 { 6 } else { readers };
     if !framed {
         n = 1;
     }
@@ -1529,7 +1616,7 @@ fn spawn_readers(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, readers: u
         while i < n {
             let pid = fork();
             if pid == 0 {
-                one_reader(ch, path, ip, port, secs, false);
+                one_reader(ch, path, ip, port, secs, WATCH_NONE);
                 exit(0);
             }
             if pid > 0 {
@@ -1543,7 +1630,7 @@ fn spawn_readers(ch: u32, path: &[u8], ip: u32, port: u16, secs: u32, readers: u
     // This one watches, so it is also the one that knows when to end it. The others sit in
     // a blocking ioctl and would not notice on their own; SIGKILL rather than SIGTERM
     // because they inherited the ring handler and it does not exit.
-    let r = one_reader(ch, path, ip, port, secs, true);
+    let r = one_reader(ch, path, ip, port, secs, WATCH_ATTACH);
     unsafe {
         let mut i = 0;
         while i < nkids {
@@ -1911,7 +1998,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     // --- record the handset microphone ---
     if a1 == b"rec" {
         if argc < 4 {
-            say(b"usage: voipcli rec <ch> <dest> [seconds, 0 = until stopped] [readers]
+            say(b"usage: voipcli rec <ch> <dest> [seconds, 0 = until stopped] [readers, 0 = solo]
 ");
             return 1;
         }
@@ -1921,6 +2008,8 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         let n = if raw.len() > 126 { 126 } else { raw.len() };
         path[..n].copy_from_slice(&raw[..n]);
         let secs = if argc >= 5 { atoi(arg(argv, 4)) } else { 0 };
+        // Nothing given means share the queue, which is the safe default on a call
+        // that is actually in progress. Ask for 0 to stop vgw and take every packet.
         let readers = if argc >= 6 { atoi(arg(argv, 5)) } else { MIC_READERS };
         return record_mic(ch, &path, secs, readers);
     }
