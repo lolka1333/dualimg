@@ -1494,7 +1494,12 @@ fn dial(ch: u32, number: &[u8]) -> c_int {
                 say(b"voipcli: ringing at the far end\n");
             }
             Some(6) => {
-                say(b"voipcli: answered - the call is up\n");
+                // Not the same thing as answered. The line reaches CONNECTED once media
+                // is flowing, and the network sends ringback as real media long before
+                // anyone picks up - measured: six calls reported here as answered went
+                // into call_log.log with no far-end media address and zero duration.
+                // Whether it was actually answered is settled by that log, not by us.
+                say(b"voipcli: media up - ringing or answered (call_log says which)\n");
                 return 0;
             }
             Some(0) => {
