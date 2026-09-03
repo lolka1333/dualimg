@@ -1431,6 +1431,17 @@ fn dial(ch: u32, number: &[u8]) -> c_int {
         return 5;
     }
 
+    // A line still up from the last call swallows the off-hook event, and the only symptom
+    // is "no dial tone" a few seconds later. Put it down first.
+    match lsm_state(ch) {
+        Some(0) | None => {}
+        _ => {
+            say(b"voipcli: the line was still up - hanging it up first\n");
+            scm_send(fd, qid, &[LSM_MSG_HOOK, LSM_EV_ON_HOOK, ch, 0, 0, 0, 0]);
+            unsafe { usleep(700_000) };
+        }
+    }
+
     if !scm_send(fd, qid, &[LSM_MSG_HOOK, LSM_EV_OFF_HOOK, ch, 0, 0, 0, 0]) {
         say(b"voipcli: the driver refused the off-hook event\n");
         unsafe { close(fd) };
@@ -1469,9 +1480,34 @@ fn dial(ch: u32, number: &[u8]) -> c_int {
         }
         i += 1;
     }
-    say(b"voipcli: dialled - watch 'voipcli lsm' for the answer\n");
+    say(b"voipcli: dialled\n");
     unsafe { close(fd) };
-    0
+
+    let mut waited = 0;
+    loop {
+        unsafe { usleep(500_000) };
+        waited += 1;
+        match lsm_state(ch) {
+            Some(4) => {
+                say(b"voipcli: ringing at the far end\n");
+            }
+            Some(6) => {
+                say(b"voipcli: answered - the call is up\n");
+                return 0;
+            }
+            Some(0) => {
+                say(b"voipcli: the call ended\n");
+                return 0;
+            }
+            _ => {}
+        }
+        if waited > 40 {
+            // Twenty seconds is longer than any inter-digit timer, so whatever it is doing
+            // now it is not waiting for us.
+            say(b"voipcli: no answer yet - 'voipcli lsm' has the current state\n");
+            return 0;
+        }
+    }
 }
 
 /// Put the handset back down.
