@@ -1484,11 +1484,13 @@ fn dial(ch: u32, number: &[u8]) -> c_int {
     unsafe { close(fd) };
 
     let mut waited = 0;
+    let mut said_ringing = false;
     loop {
         unsafe { usleep(500_000) };
         waited += 1;
         match lsm_state(ch) {
-            Some(4) => {
+            Some(4) if !said_ringing => {
+                said_ringing = true;
                 say(b"voipcli: ringing at the far end\n");
             }
             Some(6) => {
