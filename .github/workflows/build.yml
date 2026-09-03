@@ -48,10 +48,11 @@ jobs:
           if [ "$ok" != 1 ]; then
             echo "host: $(lsb_release -ds 2>/dev/null), gcc $(gcc -dumpversion)"
             echo "--- first errors ---"
-            grep -nE '\*\*\*|[Ee]rror|failed|No such file' /tmp/mcm.log | head -40 || true
-            echo "--- tail ---"
-            tail -60 /tmp/mcm.log
-            echo "::error::$(grep -m3 -E '\*\*\*|[Ee]rror' /tmp/mcm.log | tr '\n' ' ' | cut -c1-800)"
+            tail -80 /tmp/mcm.log
+            # The log is mostly tar listings, so the first line matching "error" is a
+            # file name, not a failure. What matters is the end of it.
+            echo "::error::TAIL $(tail -c 700 /tmp/mcm.log | tr '\n' '|' | tr -s '|')"
+            echo "::error::MAKE $(grep -E 'Error [0-9]|error:|cannot |not found' /tmp/mcm.log | tail -4 | tr '\n' '|' | cut -c1-700)"
             exit 1
           fi
           make install > /tmp/mcm-install.log 2>&1 || {
