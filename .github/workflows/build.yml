@@ -38,8 +38,35 @@ jobs:
           MUSL_VER = 1.2.5
           GCC_CONFIG += --with-arch=mips32 --with-float=soft
           EOF
-          for i in 1 2 3 4 5; do make -j"$(nproc)" && break || sleep 20; done
-          make install
+          # Keep the output so a failure can be reported in an annotation: job logs need
+          # a sign-in to read, annotations do not, and guessing at this has cost two runs.
+          ok=0
+          for i in 1 2 3; do
+            if make -j"$(nproc)" > /tmp/mcm.log 2>&1; then ok=1; break; fi
+            sleep 20
+          done
+          if [ "$ok" != 1 ]; then
+            echo "host: $(lsb_release -ds 2>/dev/null), gcc $(gcc -dumpversion)"
+            echo "--- first errors ---"
+            grep -nE '\*\*\*|[Ee]rror|failed|No such file' /tmp/mcm.log | head -40 || true
+            echo "--- tail ---"
+            tail -60 /tmp/mcm.log
+            echo "::error::$(grep -m3 -E '\*\*\*|[Ee]rror' /tmp/mcm.log | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          fi
+          make install > /tmp/mcm-install.log 2>&1 || {
+            tail -40 /tmp/mcm-install.log
+            echo "::error::make install failed: $(tail -c 500 /tmp/mcm-install.log | tr '\n' ' ')"
+            exit 1
+          }
+
+      - name: Keep the toolchain build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: musl-cross-make-log
+          path: /tmp/mcm*.log
+          if-no-files-found: ignore
 
       - name: Add toolchain to PATH
         run: echo "/opt/mips-linux-muslsf/bin" >> "$GITHUB_PATH"
