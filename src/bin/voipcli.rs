@@ -112,6 +112,27 @@ const IOCTL_ENDPT_PACKET: c_long = 0xc01c_d10bu32 as i32 as c_long;
 const IOCTL_ENDPT_GET_PACKET: c_long = 0xc01c_d10cu32 as i32 as c_long;
 const RTP_PAYLOAD: usize = 160; // 20 ms of 8 kHz G.711
 const RTP_HDR: usize = 12;
+// --- posting events to the line-state machine ---------------------------------------
+//
+// vgw_app does not read the hook switch itself: the DSP layer tells it, and it tells it by
+// posting a message. dspif_report_off_hook @0x4eb610 is nothing but
+// lsm_send_msg(2, 0x2e, line, 0), and lsm_send_msg @0x48ede4 is in turn an ioctl on
+// /dev/scm - the secos driver's message queue. So the same events can be posted from here,
+// by any root process, without patching vgw_app and without stopping it.
+//
+// The argument is the block secos_queue_send @0x418c24 builds: an 8-byte queue name the
+// send path ignores, the queue id at +0xc, and a seven-word message at +0x14.
+const DEV_SCM: &[u8] = b"/dev/scm\0";
+const SCM_QUEUE_SEND: c_int = 0xfa06;
+/// lsm_mcb, whose field at +8 is the queue id.
+const LSM_MCB: c_long = 0x005f4008;
+const LSM_MSG_DSP: u32 = 1;
+const LSM_MSG_HOOK: u32 = 2;
+/// Event ids, straight out of the dspif_report_* wrappers.
+const LSM_EV_DIGIT: u32 = 0x21;
+const LSM_EV_ON_HOOK: u32 = 0x2d;
+const LSM_EV_OFF_HOOK: u32 = 0x2e;
+
 /// How many processes race vgw_app for the driver's packet queue. Three is where the
 /// return flattens out: our share goes 1/2 -> 2/3 -> 3/4 and each one costs a process.
 const MIC_READERS: u32 = 3;
@@ -1355,6 +1376,125 @@ fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
     play_on(&live, ch, path, 8)
 }
 
+/// The line-state machine's queue id, read out of the running vgw_app.
+fn lsm_qid() -> Option<u32> {
+    let pid = vgw_pid();
+    if pid <= 0 {
+        return None;
+    }
+    let mut w = [0u8; 4];
+    if !read_remote(pid, LSM_MCB + 8, &mut w) {
+        return None;
+    }
+    Some(u32::from_be_bytes(w))
+}
+
+/// Post one message to the line-state machine.
+fn scm_send(fd: c_int, qid: u32, msg: &[u32; 7]) -> bool {
+    // 64 zeroed bytes: more than the 52 the driver reads, so nothing is left to chance.
+    let mut arg = [0u32; 16];
+    arg[3] = qid; // +0x0c
+    let mut i = 0usize;
+    while i < 7 {
+        arg[5 + i] = msg[i]; // +0x14 onwards
+        i += 1;
+    }
+    unsafe { ioctl(fd, SCM_QUEUE_SEND, arg.as_mut_ptr() as *mut c_void) == 0 }
+}
+
+/// Digits are indices into "0123456789*#abcd" - lsm_util_dial_digit_to_ascii @0x4926a4.
+fn digit_code(c: u8) -> Option<u32> {
+    match c {
+        b'0'..=b'9' => Some((c - b'0') as u32),
+        b'*' => Some(10),
+        b'#' => Some(11),
+        _ => None,
+    }
+}
+
+/// Lift the handset, dial, and leave the call running.
+///
+/// This is the ordinary path the firmware takes when someone picks up and dials: the line
+/// goes to dial tone, collects digits, matches the plan and originates. We only supply the
+/// events the DSP would have supplied. Nothing about vgw_app is modified.
+fn dial(ch: u32, number: &[u8]) -> c_int {
+    let qid = match lsm_qid() {
+        Some(q) => q,
+        None => {
+            say(b"voipcli: cannot read the LSM queue id from vgw_app\n");
+            return 4;
+        }
+    };
+    let fd = unsafe { open(DEV_SCM.as_ptr() as *const c_char, O_RDWR) };
+    if fd < 0 {
+        say(b"voipcli: cannot open /dev/scm\n");
+        return 5;
+    }
+
+    if !scm_send(fd, qid, &[LSM_MSG_HOOK, LSM_EV_OFF_HOOK, ch, 0, 0, 0, 0]) {
+        say(b"voipcli: the driver refused the off-hook event\n");
+        unsafe { close(fd) };
+        return 6;
+    }
+    say(b"voipcli: off-hook\n");
+
+    // Wait for dial tone before dialling; a digit sent while the line is still idle is
+    // dropped by the state machine rather than queued.
+    let mut tries = 0;
+    loop {
+        unsafe { usleep(100_000) };
+        match lsm_state(ch) {
+            Some(1) | Some(2) => break,
+            _ => {}
+        }
+        tries += 1;
+        if tries > 30 {
+            say(b"voipcli: no dial tone - the line did not come up\n");
+            scm_send(fd, qid, &[LSM_MSG_HOOK, LSM_EV_ON_HOOK, ch, 0, 0, 0, 0]);
+            unsafe { close(fd) };
+            return 7;
+        }
+    }
+
+    let mut i = 0usize;
+    while i < number.len() && number[i] != 0 {
+        if let Some(code) = digit_code(number[i]) {
+            if !scm_send(fd, qid, &[LSM_MSG_DSP, LSM_EV_DIGIT, ch, code, 0, 0, 0]) {
+                say(b"voipcli: the driver refused a digit\n");
+                unsafe { close(fd) };
+                return 8;
+            }
+            // Real dialling is not instant, and the collector has an inter-digit timer.
+            unsafe { usleep(120_000) };
+        }
+        i += 1;
+    }
+    say(b"voipcli: dialled - watch 'voipcli lsm' for the answer\n");
+    unsafe { close(fd) };
+    0
+}
+
+/// Put the handset back down.
+fn hangup(ch: u32) -> c_int {
+    let qid = match lsm_qid() {
+        Some(q) => q,
+        None => return 4,
+    };
+    let fd = unsafe { open(DEV_SCM.as_ptr() as *const c_char, O_RDWR) };
+    if fd < 0 {
+        say(b"voipcli: cannot open /dev/scm\n");
+        return 5;
+    }
+    let ok = scm_send(fd, qid, &[LSM_MSG_HOOK, LSM_EV_ON_HOOK, ch, 0, 0, 0, 0]);
+    unsafe { close(fd) };
+    if ok {
+        say(b"voipcli: on-hook\n");
+        0
+    } else {
+        6
+    }
+}
+
 /// Record what the handset microphone is picking up.
 ///
 /// vgw_app runs the same blocking ioctl in its own packet task, and the driver hands each
@@ -1995,6 +2135,19 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         let n = if raw.len() > 126 { 126 } else { raw.len() };
         path[..n].copy_from_slice(&raw[..n]);
         return ring_and_record(ch, arg(argv, 3), &path);
+    }
+
+    // --- place a call by feeding the line-state machine the events a handset would ---
+    if a1 == b"dial" {
+        if argc < 4 {
+            say(b"usage: voipcli dial <ch> <number>
+");
+            return 1;
+        }
+        return dial(atoi(arg(argv, 2)), arg(argv, 3));
+    }
+    if a1 == b"hangup" {
+        return hangup(if argc >= 3 { atoi(arg(argv, 2)) } else { 0 });
     }
 
     // --- record the handset microphone ---
