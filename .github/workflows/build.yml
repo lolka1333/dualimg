@@ -26,13 +26,18 @@ jobs:
           cd /tmp
           git clone --depth=1 https://github.com/richfelker/musl-cross-make.git
           cd musl-cross-make
-          # Pin the components. musl-cross-make defaults to a GCC 9 era toolchain, and
-          # sources that old no longer build on the current ubuntu-latest image (24.04,
-          # host GCC 13) - which is exactly how this step began failing the first time the
-          # toolchain cache expired and it had to build again instead of restoring.
+          # This step only runs when the cache misses, and GitHub evicts a cache after a
+          # week unused - so it had not run in months and broke unnoticed. Pin the
+          # components too: the defaults are a GCC 9 era toolchain, which is not a safe
+          # thing to build on the current ubuntu-latest image (24.04, host GCC 13).
           cat > config.mak <<'EOF'
           TARGET = mips-linux-muslsf
           OUTPUT = /opt/mips-linux-muslsf
+          # musl-cross-make fetches from ftpmirror.gnu.org, a redirector that picks a
+          # mirror at random - and a bad one answered for gmp three runs in a row while
+          # mpfr came down fine from the same redirector. Use the canonical server, which
+          # is slower but does not roll dice.
+          GNU_SITE = https://ftp.gnu.org/gnu
           GCC_VER = 14.2.0
           BINUTILS_VER = 2.44
           MUSL_VER = 1.2.5
