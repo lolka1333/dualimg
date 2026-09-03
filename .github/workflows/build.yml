@@ -16,7 +16,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/mips-linux-muslsf
-          key: muslsf-mips32-v1
+          key: muslsf-mips32-gcc14-v1
 
       - name: Build musl-cross-make (mips-linux-muslsf, --with-arch=mips32 --with-float=soft)
         if: steps.tc.outputs.cache-hit != 'true'
@@ -26,9 +26,16 @@ jobs:
           cd /tmp
           git clone --depth=1 https://github.com/richfelker/musl-cross-make.git
           cd musl-cross-make
+          # Pin the components. musl-cross-make defaults to a GCC 9 era toolchain, and
+          # sources that old no longer build on the current ubuntu-latest image (24.04,
+          # host GCC 13) - which is exactly how this step began failing the first time the
+          # toolchain cache expired and it had to build again instead of restoring.
           cat > config.mak <<'EOF'
           TARGET = mips-linux-muslsf
           OUTPUT = /opt/mips-linux-muslsf
+          GCC_VER = 14.2.0
+          BINUTILS_VER = 2.44
+          MUSL_VER = 1.2.5
           GCC_CONFIG += --with-arch=mips32 --with-float=soft
           EOF
           for i in 1 2 3 4 5; do make -j"$(nproc)" && break || sleep 20; done
