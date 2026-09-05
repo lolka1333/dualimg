@@ -1376,6 +1376,28 @@ fn announce(ch: u32, number: &[u8], path: &[u8]) -> c_int {
     play_on(&live, ch, path, 8)
 }
 
+/// The line manager's own names for its states, from lsm_state_str @0x539734. Printing
+/// the number alone made state 9 look like a fault when it only means the call is over
+/// and the line is waiting for the handset to go down.
+fn lsm_state_name(v: u32) -> &'static [u8] {
+    match v {
+        0 => &b"IDLE"[..],
+        1 => &b"DIAL_TONE"[..],
+        2 => &b"COLLECT"[..],
+        3 => &b"REQUEST"[..],
+        4 => &b"OUT_WAIT_ANSWER"[..],
+        5 => &b"RINGING"[..],
+        6 => &b"CONNECTED"[..],
+        7 => &b"CONNECTED_HOLD"[..],
+        8 => &b"RELEASING"[..],
+        9 => &b"WAIT_ONHOOK"[..],
+        10 => &b"OFFHOOK_ALERT"[..],
+        11 => &b"SWITCH"[..],
+        12 => &b"FXS_RES2"[..],
+        _ => &b"UNKNOWN"[..],
+    }
+}
+
 /// The line-state machine's queue id, read out of the running vgw_app.
 fn lsm_qid() -> Option<u32> {
     let pid = vgw_pid();
@@ -1502,8 +1524,10 @@ fn dial(ch: u32, number: &[u8]) -> c_int {
                 say(b"voipcli: media up - ringing or answered (call_log says which)\n");
                 return 0;
             }
-            Some(0) => {
-                say(b"voipcli: the call ended\n");
+            // RELEASING, WAIT_ONHOOK and OFFHOOK_ALERT all mean it is over; only IDLE
+            // was recognised before, so an unanswered call sat out the whole wait.
+            Some(0) | Some(8) | Some(9) | Some(10) => {
+                say(b"voipcli: the call ended - run 'voipcli hangup' to clear the line\n");
                 return 0;
             }
             _ => {}
@@ -2129,10 +2153,17 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
                 let h = b"lsm state=";
                 m[..h.len()].copy_from_slice(h);
                 let mut k = put_num(&mut m, h.len(), v);
-                let t = b"  (0 idle, 1 dial-tone, 2 collect, 6 connected, 10 howler)
-";
+                m[k] = b' ';
+                k += 1;
+                m[k] = b'(';
+                k += 1;
+                let t = lsm_state_name(v);
                 m[k..k + t.len()].copy_from_slice(t);
                 k += t.len();
+                m[k] = b')';
+                k += 1;
+                m[k] = b'\n';
+                k += 1;
                 say(&m[..k]);
                 0
             }
