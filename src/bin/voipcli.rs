@@ -1517,6 +1517,56 @@ fn dial(ch: u32, number: &[u8]) -> c_int {
     }
 }
 
+/// Press keys on a call that is already up, the way a hand would.
+///
+/// The same digit event as dialling. `dspif_report_dtmf` is the only source of digits in
+/// the system - the firmware uses it both to collect a number and to relay a keypress mid
+/// call - so what a digit means is decided by the line state, not by who sent it. During a
+/// call the line manager hands it to SipCtrlSendDTMF and it goes out to the far end.
+fn press_keys(ch: u32, digits: &[u8]) -> c_int {
+    let qid = match lsm_qid() {
+        Some(q) => q,
+        None => {
+            say(b"voipcli: cannot read the LSM queue id from vgw_app\n");
+            return 4;
+        }
+    };
+    match lsm_state(ch) {
+        Some(0) => say(b"voipcli: the line is idle - keys will go nowhere\n"),
+        _ => {}
+    }
+    let fd = unsafe { open(DEV_SCM.as_ptr() as *const c_char, O_RDWR) };
+    if fd < 0 {
+        say(b"voipcli: cannot open /dev/scm\n");
+        return 5;
+    }
+    let mut sent = 0u32;
+    let mut i = 0usize;
+    while i < digits.len() && digits[i] != 0 {
+        if let Some(code) = digit_code(digits[i]) {
+            if !scm_send(fd, qid, &[LSM_MSG_DSP, LSM_EV_DIGIT, ch, code, 0, 0, 0]) {
+                say(b"voipcli: the driver refused a digit\n");
+                unsafe { close(fd) };
+                return 8;
+            }
+            sent += 1;
+            // Menus want the digits apart; a finger is slower than this.
+            unsafe { usleep(200_000) };
+        }
+        i += 1;
+    }
+    unsafe { close(fd) };
+    let mut m = [0u8; 48];
+    let h = b"voipcli: pressed ";
+    m[..h.len()].copy_from_slice(h);
+    let mut k = put_num(&mut m, h.len(), sent);
+    let t = b" keys\n";
+    m[k..k + t.len()].copy_from_slice(t);
+    k += t.len();
+    say(&m[..k]);
+    0
+}
+
 /// Put the handset back down.
 fn hangup(ch: u32) -> c_int {
     let qid = match lsm_qid() {
@@ -2188,6 +2238,14 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             return 1;
         }
         return dial(atoi(arg(argv, 2)), arg(argv, 3));
+    }
+    if a1 == b"keys" {
+        if argc < 4 {
+            say(b"usage: voipcli keys <ch> <digits>   (0-9, * and #)
+");
+            return 1;
+        }
+        return press_keys(atoi(arg(argv, 2)), arg(argv, 3));
     }
     if a1 == b"hangup" {
         return hangup(if argc >= 3 { atoi(arg(argv, 2)) } else { 0 });
